@@ -1,3 +1,17 @@
+> **GrowthLoop Vendor Fork**
+>
+> This is a GrowthLoop-maintained fork of Prefect. We vendor Prefect to apply patches that are not yet available upstream.
+>
+> **Active branch:** [`growthloop/3.6.27-drain-on-sigterm`](https://github.com/GrowthLoop/prefect/tree/growthloop/3.6.27-drain-on-sigterm)
+>
+> **Patch summary:** Adds `PREFECT_WORKER_DRAIN_ON_SIGTERM` support. When enabled, Prefect workers will gracefully drain (stop accepting new work and finish in-progress flow runs) upon receiving a `SIGTERM` signal instead of exiting immediately.
+>
+> **Building the wheel:**
+> ```bash
+> uv build --wheel
+> ```
+> The built wheel will be emitted to the `dist/` directory.
+
 <p align="center"><img src="https://github.com/PrefectHQ/prefect/assets/3407835/c654cbc6-63e8-4ada-a92a-efd2f8f24b85" width=1000></p>
 
 <p align="center">
