@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "prefect"
-dynamic = ["version"]
+version = "3.6.27+growthloop"
 description = "Workflow orchestration and management."
 readme = "README.md"
 requires-python = ">=3.10,<3.15"
@@ -223,8 +223,6 @@ type-checking = [
 
 benchmark = ["pytest-benchmark>=5.1.0", "pytest-codspeed>=2.2.1"]
 
-[tool.hatch.version]
-source = "versioningit"
 
 [tool.versioningit]
 # This fallback is used in git-less environments (e.g. archive builds).

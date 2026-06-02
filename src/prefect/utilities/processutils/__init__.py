@@ -35,6 +35,8 @@ TextSink: TypeAlias = Union[anyio.AsyncFile[AnyStr], TextIO, TextSendStream]
 PrintFn: TypeAlias = Callable[[str], object]
 T = TypeVar("T", infer_variance=True)
 
+_worker_drain_requested = False
+
 
 def sanitize_subprocess_env(
     env: Mapping[str, str | None] | None,
@@ -50,6 +52,15 @@ def sanitize_subprocess_env(
         return {}
 
     return {key: value for key, value in env.items() if value is not None}
+
+
+def request_worker_drain() -> None:
+    global _worker_drain_requested
+    _worker_drain_requested = True
+
+
+def worker_drain_requested() -> bool:
+    return _worker_drain_requested
 
 
 if sys.platform == "win32":
@@ -319,23 +330,24 @@ async def open_process(
         windll.kernel32.SetConsoleCtrlHandler(_win32_ctrl_handler, 1)
 
     try:
-        async with process:
-            yield process
+        yield process
     finally:
-        try:
-            process.terminate()
-            if sys.platform == "win32" and win32_process_group:
-                _windows_process_group_pids.remove(process.pid)
+        if not worker_drain_requested():
+            try:
+                process.terminate()
 
-        except OSError:
-            # Occurs if the process is already terminated
-            pass
+            except OSError:
+                # Occurs if the process is already terminated
+                pass
 
-        # Ensure the process resource is closed. If not shielded from cancellation,
-        # this resource can be left open and the subprocess output can appear after
-        # the parent process has exited.
-        with anyio.CancelScope(shield=True):
-            await process.aclose()
+            # Ensure the process resource is closed. If not shielded from cancellation,
+            # this resource can be left open and the subprocess output can appear after
+            # the parent process has exited.
+            with anyio.CancelScope(shield=True):
+                await process.aclose()
+
+        if sys.platform == "win32" and win32_process_group:
+            _windows_process_group_pids.discard(process.pid)
 
 
 @overload
@@ -545,7 +557,10 @@ def setup_signal_handlers_agent(pid: int, process_name: str, print_fn: PrintFn) 
 
 
 def setup_signal_handlers_worker(
-    pid: int, process_name: str, print_fn: PrintFn
+    pid: int,
+    process_name: str,
+    print_fn: PrintFn,
+    request_drain: Optional[Callable[[], None]] = None,
 ) -> None:
     """Handle interrupts of workers gracefully."""
     setup_handler = partial(
@@ -560,8 +575,29 @@ def setup_signal_handlers_worker(
     else:
         # forward first SIGINT directly, send SIGKILL on subsequent interrupt
         setup_handler(signal.SIGINT, signal.SIGINT, signal.SIGKILL)
-        # first SIGTERM: send SIGINT, send SIGKILL on subsequent SIGTERM
-        setup_handler(signal.SIGTERM, signal.SIGINT, signal.SIGKILL)
+        if request_drain is not None:
+            drained = False
+
+            def handle_sigterm(*arg: Any) -> None:
+                nonlocal drained
+                if not drained:
+                    drained = True
+                    print_fn(
+                        f"Received SIGTERM. Draining {process_name} (PID {pid})..."
+                    )
+                    request_worker_drain()
+                    request_drain()
+                else:
+                    print_fn(
+                        f"Received SIGTERM while draining. Sending SIGINT to"
+                        f" {process_name} (PID {pid})..."
+                    )
+                    os.kill(pid, signal.SIGINT)
+
+            _register_signal(signal.SIGTERM, handle_sigterm)
+        else:
+            # first SIGTERM: send SIGINT, send SIGKILL on subsequent SIGTERM
+            setup_handler(signal.SIGTERM, signal.SIGINT, signal.SIGKILL)
 
 
 def get_sys_executable() -> str:

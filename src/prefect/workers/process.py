@@ -16,6 +16,7 @@ checkout out the [Prefect docs](https://docs.prefect.io/v3/concepts/work-pools/)
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import os
 import tempfile
@@ -166,63 +167,83 @@ class ProcessWorker(
         """
         healthcheck_server = None
         healthcheck_thread = None
+
+        async def wait_for_active_runs() -> None:
+            while self._submitting_flow_run_ids or self._active_flow_run_ids:
+                self._logger.debug(
+                    "Waiting for %s active run(s) to finish before shutdown...",
+                    len(self._submitting_flow_run_ids) + len(self._active_flow_run_ids),
+                )
+                await anyio.sleep(0.1)
+
         try:
             async with self as worker:
                 # wait for an initial heartbeat to configure the worker
                 await worker.sync_with_backend()
                 # schedule the scheduled flow run polling loop
-                async with anyio.create_task_group() as loops_task_group:
-                    loops_task_group.start_soon(
-                        partial(
-                            critical_service_loop,
-                            workload=self.get_and_submit_flow_runs,
-                            interval=PREFECT_WORKER_QUERY_SECONDS.value(),
-                            run_once=run_once,
-                            jitter_range=0.3,
-                            backoff=4,  # Up to ~1 minute interval during backoff
+                try:
+                    async with anyio.create_task_group() as loops_task_group:
+                        self._service_task_group = loops_task_group
+                        # if a drain was requested before the loops started, stop
+                        # polling immediately.
+                        if self._draining:
+                            loops_task_group.cancel_scope.cancel()
+
+                        loops_task_group.start_soon(
+                            partial(
+                                critical_service_loop,
+                                workload=self.get_and_submit_flow_runs,
+                                interval=PREFECT_WORKER_QUERY_SECONDS.value(),
+                                run_once=run_once,
+                                jitter_range=0.3,
+                                backoff=4,  # Up to ~1 minute interval during backoff
+                            )
                         )
-                    )
-                    # schedule the sync loop
-                    loops_task_group.start_soon(
-                        partial(
-                            critical_service_loop,
-                            workload=self.sync_with_backend,
-                            interval=self.heartbeat_interval_seconds,
-                            run_once=run_once,
-                            jitter_range=0.3,
-                            backoff=4,
+                        # schedule the sync loop
+                        loops_task_group.start_soon(
+                            partial(
+                                critical_service_loop,
+                                workload=self.sync_with_backend,
+                                interval=self.heartbeat_interval_seconds,
+                                run_once=run_once,
+                                jitter_range=0.3,
+                                backoff=4,
+                            )
                         )
-                    )
 
-                    self._started_event = await self._emit_worker_started_event()
+                        self._started_event = await self._emit_worker_started_event()
 
-                    start_client_metrics_server()
+                        start_client_metrics_server()
 
-                    if with_healthcheck:
-                        from prefect.workers.server import build_healthcheck_server
+                        if with_healthcheck:
+                            from prefect.workers.server import build_healthcheck_server
 
-                        # we'll start the ASGI server in a separate thread so that
-                        # uvicorn does not block the main thread
-                        healthcheck_server = build_healthcheck_server(
-                            worker=worker,
-                            query_interval_seconds=PREFECT_WORKER_QUERY_SECONDS.value(),
-                        )
-                        healthcheck_thread = threading.Thread(
-                            name="healthcheck-server-thread",
-                            target=healthcheck_server.run,
-                            daemon=True,
-                        )
-                        healthcheck_thread.start()
-                    printer(f"Worker {worker.name!r} started!")
+                            # we'll start the ASGI server in a separate thread so that
+                            # uvicorn does not block the main thread
+                            healthcheck_server = build_healthcheck_server(
+                                worker=worker,
+                                query_interval_seconds=PREFECT_WORKER_QUERY_SECONDS.value(),
+                            )
+                            healthcheck_thread = threading.Thread(
+                                name="healthcheck-server-thread",
+                                target=healthcheck_server.run,
+                                daemon=True,
+                            )
+                            healthcheck_thread.start()
+                        printer(f"Worker {worker.name!r} started!")
+                except asyncio.CancelledError:
+                    if not self._draining:
+                        raise
+                finally:
+                    self._service_task_group = None
 
+                # If we were asked to drain, wait for active runs to complete before
+                # exiting the worker process.
+                if self._draining:
+                    await wait_for_active_runs()
                 # If running once, wait for active runs to complete before exiting
-                if run_once and self._limiter:
-                    while self.limiter.borrowed_tokens > 0:
-                        self._logger.debug(
-                            "Waiting for %s active run(s) to finish before shutdown...",
-                            self.limiter.borrowed_tokens,
-                        )
-                        await anyio.sleep(0.1)
+                if run_once:
+                    await wait_for_active_runs()
         finally:
             stop_client_metrics_server()
 

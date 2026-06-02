@@ -607,13 +607,16 @@ class BaseWorker(abc.ABC, Generic[C, V, R]):
         self._work_pool: Optional[WorkPool] = None
         self._exit_stack: AsyncExitStack = AsyncExitStack()
         self._runs_task_group: Optional[anyio.abc.TaskGroup] = None
+        self._service_task_group: Optional[anyio.abc.TaskGroup] = None
         self._client: Optional[PrefectClient] = None
         self._last_polled_time: datetime.datetime = prefect.types._datetime.now("UTC")
         self._limit = limit
         self._limiter: Optional[anyio.CapacityLimiter] = None
         self._submitting_flow_run_ids: set[UUID] = set()
+        self._active_flow_run_ids: set[UUID] = set()
         self._scheduled_task_scopes: set[anyio.CancelScope] = set()
         self._worker_metadata_sent = False
+        self._draining = False
 
         # Cancellation handling
         self._cancelling_observer: Optional[FlowRunCancellingObserver] = None
@@ -641,6 +644,11 @@ class BaseWorker(abc.ABC, Generic[C, V, R]):
                 "Worker has not been correctly initialized. Please use the worker class as an async context manager."
             )
         return self._limiter
+
+    def request_drain(self) -> None:
+        self._draining = True
+        if self._service_task_group is not None:
+            self._service_task_group.cancel_scope.cancel()
 
     @classmethod
     def get_documentation_url(cls) -> str:
@@ -1151,6 +1159,7 @@ class BaseWorker(abc.ABC, Generic[C, V, R]):
 
         await self._exit_stack.__aexit__(*exc_info)
         self._runs_task_group = None
+        self._service_task_group = None
         self._client = None
 
     def is_worker_still_polling(self, query_interval_seconds: float) -> bool:
@@ -1426,61 +1435,66 @@ class BaseWorker(abc.ABC, Generic[C, V, R]):
         Submits a given flow run for execution by the worker.
         """
         run_logger = self.get_flow_run_logger(flow_run)
-
-        if flow_run.deployment_id:
-            try:
-                await self.client.read_deployment(flow_run.deployment_id)
-            except ObjectNotFound:
-                self._logger.exception(
-                    f"Deployment {flow_run.deployment_id} no longer exists. "
-                    f"Flow run {flow_run.id} will not be submitted for"
-                    " execution"
-                )
-                self._submitting_flow_run_ids.remove(flow_run.id)
-                if self._cancelling_observer is not None:
-                    self._cancelling_observer.remove_in_flight_flow_run_id(flow_run.id)
-                await self._mark_flow_run_as_cancelled(
-                    flow_run,
-                    state_updates=dict(
-                        message=f"Deployment {flow_run.deployment_id} no longer exists, cancelled run."
-                    ),
-                )
-                return
-
-        ready_to_submit = await self._propose_pending_state(flow_run)
-        self._logger.debug(f"Ready to submit {flow_run.id}: {ready_to_submit}")
-        if ready_to_submit:
-            if TYPE_CHECKING:
-                assert self._runs_task_group is not None
-            readiness_result = await self._runs_task_group.start(
-                self._submit_run_and_capture_errors, flow_run
-            )
-
-            if readiness_result and not isinstance(readiness_result, Exception):
+        self._active_flow_run_ids.add(flow_run.id)
+        try:
+            if flow_run.deployment_id:
                 try:
-                    await self.client.update_flow_run(
-                        flow_run_id=flow_run.id,
-                        infrastructure_pid=str(readiness_result),
+                    await self.client.read_deployment(flow_run.deployment_id)
+                except ObjectNotFound:
+                    self._logger.exception(
+                        f"Deployment {flow_run.deployment_id} no longer exists. "
+                        f"Flow run {flow_run.id} will not be submitted for"
+                        " execution"
                     )
-                except Exception:
-                    run_logger.exception(
-                        "An error occurred while setting the `infrastructure_pid` on "
-                        f"flow run {flow_run.id!r}. The flow run will "
-                        "not be cancellable."
+                    self._submitting_flow_run_ids.discard(flow_run.id)
+                    if self._cancelling_observer is not None:
+                        self._cancelling_observer.remove_in_flight_flow_run_id(
+                            flow_run.id
+                        )
+                    await self._mark_flow_run_as_cancelled(
+                        flow_run,
+                        state_updates=dict(
+                            message=f"Deployment {flow_run.deployment_id} no longer exists, cancelled run."
+                        ),
                     )
+                    return
 
-                run_logger.info(
-                    f"Flow run '{flow_run.name}' submitted to infrastructure"
+            ready_to_submit = await self._propose_pending_state(flow_run)
+            self._logger.debug(f"Ready to submit {flow_run.id}: {ready_to_submit}")
+            if ready_to_submit:
+                if TYPE_CHECKING:
+                    assert self._runs_task_group is not None
+                readiness_result = await self._runs_task_group.start(
+                    self._submit_run_and_capture_errors, flow_run
                 )
 
+                if readiness_result and not isinstance(readiness_result, Exception):
+                    try:
+                        await self.client.update_flow_run(
+                            flow_run_id=flow_run.id,
+                            infrastructure_pid=str(readiness_result),
+                        )
+                    except Exception:
+                        run_logger.exception(
+                            "An error occurred while setting the `infrastructure_pid` on "
+                            f"flow run {flow_run.id!r}. The flow run will "
+                            "not be cancellable."
+                        )
+
+                    run_logger.info(
+                        f"Flow run '{flow_run.name}' submitted to infrastructure"
+                    )
+
+                else:
+                    # If the run is not ready to submit, release the concurrency slot
+                    self._release_limit_slot(flow_run.id)
             else:
-                # If the run is not ready to submit, release the concurrency slot
                 self._release_limit_slot(flow_run.id)
-        else:
-            self._release_limit_slot(flow_run.id)
-        self._submitting_flow_run_ids.remove(flow_run.id)
-        if self._cancelling_observer is not None:
-            self._cancelling_observer.remove_in_flight_flow_run_id(flow_run.id)
+        finally:
+            self._submitting_flow_run_ids.discard(flow_run.id)
+            if self._cancelling_observer is not None:
+                self._cancelling_observer.remove_in_flight_flow_run_id(flow_run.id)
+            self._active_flow_run_ids.discard(flow_run.id)
 
     async def _submit_run_and_capture_errors(
         self,
