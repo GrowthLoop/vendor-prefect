@@ -142,6 +142,34 @@ class ProcessWorker(
     _documentation_url = "https://docs.prefect.io/latest/get-started/quickstart"
     _logo_url = "https://cdn.sanity.io/images/3ugk85nk/production/356e6766a91baf20e1d08bbe16e8b5aaef4d8643-48x48.png"
 
+    def __init__(self, *args: Any, **kwargs: Any):
+        super().__init__(*args, **kwargs)
+        self._in_flight_flow_run_ids: set[UUID] = set()
+
+    async def _submit_run_and_capture_errors(
+        self,
+        flow_run: "FlowRun",
+        task_status: anyio.abc.TaskStatus[int | Exception] | None = None,
+    ) -> BaseWorkerResult | Exception:
+        self._in_flight_flow_run_ids.add(flow_run.id)
+        try:
+            return await super()._submit_run_and_capture_errors(
+                flow_run, task_status=task_status
+            )
+        finally:
+            self._in_flight_flow_run_ids.discard(flow_run.id)
+
+    async def _wait_for_in_flight_runs(self, poll_interval: float = 0.1) -> None:
+        while self._submitting_flow_run_ids or self._in_flight_flow_run_ids:
+            active_run_count = len(
+                self._submitting_flow_run_ids | self._in_flight_flow_run_ids
+            )
+            self._logger.debug(
+                "Waiting for %s active run(s) to finish before shutdown...",
+                active_run_count,
+            )
+            await anyio.sleep(poll_interval)
+
     async def start(
         self,
         run_once: bool = False,
@@ -167,14 +195,6 @@ class ProcessWorker(
         """
         healthcheck_server = None
         healthcheck_thread = None
-
-        async def wait_for_active_runs() -> None:
-            while self._submitting_flow_run_ids or self._active_flow_run_ids:
-                self._logger.debug(
-                    "Waiting for %s active run(s) to finish before shutdown...",
-                    len(self._submitting_flow_run_ids) + len(self._active_flow_run_ids),
-                )
-                await anyio.sleep(0.1)
 
         try:
             async with self as worker:
@@ -240,10 +260,10 @@ class ProcessWorker(
                 # If we were asked to drain, wait for active runs to complete before
                 # exiting the worker process.
                 if self._draining:
-                    await wait_for_active_runs()
+                    await self._wait_for_in_flight_runs()
                 # If running once, wait for active runs to complete before exiting
                 if run_once:
-                    await wait_for_active_runs()
+                    await self._wait_for_in_flight_runs()
         finally:
             stop_client_metrics_server()
 

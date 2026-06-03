@@ -2,6 +2,7 @@ import subprocess
 import sys
 from unittest import mock
 
+import anyio
 import pytest
 
 import prefect.utilities.processutils
@@ -194,6 +195,57 @@ class TestOpenProcess:
     async def test_runs_if_cmd_is_list(self):
         async with open_process(self.list_cmd) as process:
             assert process
+
+    async def test_worker_drain_closes_process_without_terminating(self, monkeypatch):
+        monkeypatch.setattr(
+            prefect.utilities.processutils, "_worker_drain_requested", False
+        )
+
+        mock_process = mock.AsyncMock()
+        mock_process.terminate = mock.MagicMock()
+        mock_open_process = mock.AsyncMock(return_value=mock_process)
+        monkeypatch.setattr(
+            prefect.utilities.processutils.anyio,
+            "open_process",
+            mock_open_process,
+        )
+
+        async with open_process(self.list_cmd):
+            prefect.utilities.processutils.request_worker_drain()
+
+        mock_process.terminate.assert_not_called()
+        mock_process.aclose.assert_awaited_once()
+
+    async def test_worker_drain_cancellation_terminates_and_closes_process(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(
+            prefect.utilities.processutils, "_worker_drain_requested", False
+        )
+
+        mock_process = mock.AsyncMock()
+        mock_process.terminate = mock.MagicMock()
+        mock_open_process = mock.AsyncMock(return_value=mock_process)
+        monkeypatch.setattr(
+            prefect.utilities.processutils.anyio,
+            "open_process",
+            mock_open_process,
+        )
+        process_context_started = anyio.Event()
+
+        async def run_process_context():
+            async with open_process(self.list_cmd):
+                prefect.utilities.processutils.request_worker_drain()
+                process_context_started.set()
+                await anyio.sleep_forever()
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(run_process_context)
+            await process_context_started.wait()
+            tg.cancel_scope.cancel()
+
+        mock_process.terminate.assert_called_once()
+        mock_process.aclose.assert_awaited_once()
 
     @pytest.mark.windows
     async def test_windows_uses_list2cmdline_for_command_joining(self, monkeypatch):

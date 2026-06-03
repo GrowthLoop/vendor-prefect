@@ -4072,6 +4072,7 @@ wheels = [
 
 [[package]]
 name = "prefect"
+version = "3.6.27+growthloop"
 source = { editable = "." }
 dependencies = [
     { name = "aiosqlite" },
@@ -4359,7 +4360,7 @@ requires-dist = [
     { name = "websockets", specifier = ">=15.0.1,<17.0" },
     { name = "whenever", marker = "python_full_version >= '3.13'", specifier = ">=0.7.3,<0.11.0" },
 ]
-provides-extras = ["aws", "azure", "bitbucket", "buildx", "bundles", "dask", "databricks", "dbt", "docker", "email", "gcp", "github", "gitlab", "kubernetes", "otel", "ray", "redis", "shell", "slack", "snowflake", "sqlalchemy"]
+provides-extras = ["otel", "bundles", "aws", "azure", "gcp", "docker", "kubernetes", "shell", "buildx", "dask", "ray", "bitbucket", "github", "gitlab", "databricks", "dbt", "snowflake", "sqlalchemy", "redis", "email", "slack"]
 
 [package.metadata.requires-dev]
 benchmark = [

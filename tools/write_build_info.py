@@ -4,7 +4,7 @@ import os
 import textwrap
 from datetime import datetime, timezone
 from pathlib import Path
-from subprocess import CalledProcessError, check_output
+from subprocess import DEVNULL, CalledProcessError, check_output
 from typing import Any
 
 
@@ -32,8 +32,10 @@ def write_build_info(
     path = Path(project_dir) / params.get("path", "src/prefect/_version.py")
 
     try:
-        git_hash = check_output(["git", "rev-parse", "HEAD"]).decode().strip()
-    except CalledProcessError:
+        git_hash = (
+            check_output(["git", "rev-parse", "HEAD"], stderr=DEVNULL).decode().strip()
+        )
+    except (CalledProcessError, FileNotFoundError):
         git_hash = "unknown"
 
     build_dt_str = template_fields.get(
@@ -52,7 +54,26 @@ def write_build_info(
             """
     )
 
+    path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as f:
         f.write(build_info)
 
     _write_analytics_config(Path(project_dir))
+
+
+def get_build_hook():
+    from hatchling.builders.hooks.plugin.interface import BuildHookInterface
+
+    class BuildInfoBuildHook(BuildHookInterface):
+        def initialize(self, version: str, build_data: dict[str, Any]) -> None:
+            write_build_info(
+                self.root,
+                {"version": self.metadata.version},
+                {
+                    "path": self.config.get(
+                        "build-info-path", "src/prefect/_build_info.py"
+                    )
+                },
+            )
+
+    return BuildInfoBuildHook

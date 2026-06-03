@@ -329,10 +329,13 @@ async def open_process(
         # already registered.
         windll.kernel32.SetConsoleCtrlHandler(_win32_ctrl_handler, 1)
 
+    context_exited_cleanly = False
+
     try:
         yield process
+        context_exited_cleanly = True
     finally:
-        if not worker_drain_requested():
+        if not (context_exited_cleanly and worker_drain_requested()):
             try:
                 process.terminate()
 
@@ -340,11 +343,11 @@ async def open_process(
                 # Occurs if the process is already terminated
                 pass
 
-            # Ensure the process resource is closed. If not shielded from cancellation,
-            # this resource can be left open and the subprocess output can appear after
-            # the parent process has exited.
-            with anyio.CancelScope(shield=True):
-                await process.aclose()
+        # Ensure the process resource is closed. If not shielded from cancellation,
+        # this resource can be left open and the subprocess output can appear after
+        # the parent process has exited.
+        with anyio.CancelScope(shield=True):
+            await process.aclose()
 
         if sys.platform == "win32" and win32_process_group:
             _windows_process_group_pids.discard(process.pid)

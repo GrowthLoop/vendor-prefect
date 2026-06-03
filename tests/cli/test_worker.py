@@ -3,6 +3,7 @@ import signal
 import sys
 import tempfile
 from pathlib import Path
+from typing import ClassVar
 from unittest.mock import ANY, AsyncMock, MagicMock
 
 import anyio
@@ -24,6 +25,7 @@ from prefect.testing.cli import invoke_and_assert
 from prefect.utilities.asyncutils import run_sync_in_worker_thread
 from prefect.utilities.processutils import open_process
 from prefect.workers.base import BaseJobConfiguration, BaseWorker
+from prefect.workers.process import ProcessWorker
 
 pytestmark = pytest.mark.usefixtures("asserting_events_worker")
 
@@ -34,6 +36,17 @@ class MockKubernetesWorker(BaseWorker):
 
     async def run(self):
         pass
+
+
+class MockProcessWorker(ProcessWorker):
+    type = "mock-process"
+    instances: ClassVar[list["MockProcessWorker"]] = []
+
+    def __init__(self, **kwargs):
+        self.name = kwargs.get("name") or "mock-process-worker"
+        self.request_drain = MagicMock()
+        self.start = AsyncMock()
+        self.instances.append(self)
 
 
 @pytest.fixture
@@ -100,6 +113,107 @@ def mock_worker(monkeypatch):
         prefect.cli._worker_utils, "lookup_type", lambda x, y: mock_worker
     )
     return mock_worker
+
+
+@pytest.mark.usefixtures("use_hosted_api_server")
+async def test_start_worker_does_not_wire_sigterm_drain_by_default(
+    monkeypatch: pytest.MonkeyPatch, process_work_pool
+):
+    import prefect.cli._worker_utils
+    import prefect.utilities.processutils
+    from prefect.cli.worker import start
+
+    setup_signal_handlers = MagicMock()
+    monkeypatch.delenv("PREFECT_WORKER_DRAIN_ON_SIGTERM", raising=False)
+    monkeypatch.setattr(
+        prefect.cli._worker_utils,
+        "lookup_type",
+        lambda worker_type, console: MockProcessWorker,
+    )
+    monkeypatch.setattr(
+        prefect.utilities.processutils,
+        "setup_signal_handlers_worker",
+        setup_signal_handlers,
+    )
+
+    await start(
+        work_pool_name=process_work_pool.name,
+        worker_type="process",
+        run_once=True,
+    )
+
+    assert setup_signal_handlers.call_args.kwargs["request_drain"] is None
+
+
+@pytest.mark.usefixtures("use_hosted_api_server")
+async def test_start_worker_wires_sigterm_drain_for_process_worker(
+    monkeypatch: pytest.MonkeyPatch, process_work_pool
+):
+    import prefect.cli._worker_utils
+    import prefect.utilities.processutils
+    from prefect.cli.worker import start
+
+    setup_signal_handlers = MagicMock()
+
+    MockProcessWorker.instances.clear()
+    monkeypatch.setenv("PREFECT_WORKER_DRAIN_ON_SIGTERM", "true")
+    monkeypatch.setattr(
+        prefect.cli._worker_utils,
+        "lookup_type",
+        lambda worker_type, console: MockProcessWorker,
+    )
+    monkeypatch.setattr(
+        prefect.utilities.processutils,
+        "setup_signal_handlers_worker",
+        setup_signal_handlers,
+    )
+
+    await start(
+        work_pool_name=process_work_pool.name,
+        worker_type="process",
+        run_once=True,
+    )
+
+    assert setup_signal_handlers.call_args.kwargs["request_drain"] is (
+        MockProcessWorker.instances[0].request_drain
+    )
+
+
+@pytest.mark.usefixtures("use_hosted_api_server")
+async def test_start_worker_does_not_wire_sigterm_drain_for_non_process_worker(
+    monkeypatch: pytest.MonkeyPatch, process_work_pool
+):
+    import prefect.cli._worker_utils
+    import prefect.utilities.processutils
+    from prefect.cli.worker import start
+
+    setup_signal_handlers = MagicMock()
+
+    def mock_init(self, **kwargs):
+        self.name = kwargs.get("name") or "mock-kubernetes-worker"
+        self.request_drain = MagicMock()
+        self.start = AsyncMock()
+
+    monkeypatch.setenv("PREFECT_WORKER_DRAIN_ON_SIGTERM", "true")
+    monkeypatch.setattr(MockKubernetesWorker, "__init__", mock_init)
+    monkeypatch.setattr(
+        prefect.cli._worker_utils,
+        "lookup_type",
+        lambda worker_type, console: MockKubernetesWorker,
+    )
+    monkeypatch.setattr(
+        prefect.utilities.processutils,
+        "setup_signal_handlers_worker",
+        setup_signal_handlers,
+    )
+
+    await start(
+        work_pool_name=process_work_pool.name,
+        worker_type="kubernetes-test",
+        run_once=True,
+    )
+
+    assert setup_signal_handlers.call_args.kwargs["request_drain"] is None
 
 
 @pytest.mark.usefixtures("use_hosted_api_server")

@@ -127,6 +127,7 @@ async def start(
         PREFECT_WORKER_PREFETCH_SECONDS,
     )
     from prefect.utilities.processutils import setup_signal_handlers_worker
+    from prefect.workers.process import ProcessWorker
 
     # Prompt for work pool name if not provided (matches typer's prompt=True)
     if work_pool_name is None:
@@ -225,12 +226,18 @@ async def start(
     )
 
     worker_process_id = os.getpid()
-    drain_on_sigterm = os.getenv("PREFECT_WORKER_DRAIN_ON_SIGTERM", "").lower() == "true"
+    drain_on_sigterm = (
+        os.getenv("PREFECT_WORKER_DRAIN_ON_SIGTERM", "").lower() == "true"
+    )
     setup_signal_handlers_worker(
         worker_process_id,
         f"the {worker_type} worker",
         _cli.console.print,
-        request_drain=worker.request_drain if drain_on_sigterm else None,
+        request_drain=(
+            worker.request_drain
+            if drain_on_sigterm and isinstance(worker, ProcessWorker)
+            else None
+        ),
     )
 
     try:

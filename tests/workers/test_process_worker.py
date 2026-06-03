@@ -22,6 +22,7 @@ from prefect.server.schemas.actions import (
     WorkPoolCreate,
 )
 from prefect.types._datetime import now
+from prefect.workers.base import BaseWorker
 from prefect.workers.process import (
     ProcessWorker,
     ProcessWorkerResult,
@@ -531,6 +532,71 @@ async def test_task_status_receives_pid(
         )
 
         fake_status.started.assert_called_once_with(int(result.identifier))
+
+
+async def test_process_worker_start_waits_after_drain_request(
+    process_work_pool: WorkPool,
+):
+    worker = ProcessWorker(work_pool_name=process_work_pool.name)
+    worker.request_drain()
+    worker._wait_for_in_flight_runs = AsyncMock()
+
+    await worker.start()
+
+    worker._wait_for_in_flight_runs.assert_awaited_once()
+
+
+@pytest.mark.parametrize("limit", [None, 1])
+async def test_process_worker_tracks_in_flight_runs_until_infrastructure_exits(
+    process_work_pool: WorkPool,
+    flow_run: FlowRun,
+    monkeypatch: pytest.MonkeyPatch,
+    limit: int | None,
+):
+    release_run = anyio.Event()
+
+    async def fake_submit_run_and_capture_errors(
+        self: BaseWorker,
+        flow_run: FlowRun,
+        task_status: anyio.abc.TaskStatus[int | Exception] | None = None,
+    ) -> ProcessWorkerResult:
+        if task_status:
+            task_status.started(1000)
+        await release_run.wait()
+        return ProcessWorkerResult(status_code=0, identifier="1000")
+
+    monkeypatch.setattr(
+        BaseWorker,
+        "_submit_run_and_capture_errors",
+        fake_submit_run_and_capture_errors,
+    )
+
+    worker = ProcessWorker(work_pool_name=process_work_pool.name, limit=limit)
+    wait_finished = anyio.Event()
+
+    async def wait_for_in_flight_runs() -> None:
+        await worker._wait_for_in_flight_runs(poll_interval=0.01)
+        wait_finished.set()
+
+    async with anyio.create_task_group() as task_group:
+        infrastructure_pid = await task_group.start(
+            worker._submit_run_and_capture_errors,
+            flow_run,
+        )
+
+        assert infrastructure_pid == 1000
+        assert flow_run.id in worker._in_flight_flow_run_ids
+
+        task_group.start_soon(wait_for_in_flight_runs)
+        with anyio.move_on_after(0.02):
+            await wait_finished.wait()
+        assert not wait_finished.is_set()
+
+        release_run.set()
+        with anyio.fail_after(1):
+            await wait_finished.wait()
+
+    assert flow_run.id not in worker._in_flight_flow_run_ids
 
 
 async def test_submit_adhoc_run_with_existing_flow_run_reuses_id(
