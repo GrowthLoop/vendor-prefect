@@ -546,6 +546,75 @@ async def test_process_worker_start_waits_after_drain_request(
     worker._wait_for_in_flight_runs.assert_awaited_once()
 
 
+async def test_process_worker_start_drains_in_flight_subprocess(
+    flow: Flow,
+    prefect_client: PrefectClient,
+    process_work_pool: WorkPool,
+    tmp_path: Path,
+):
+    listener = await anyio.create_tcp_listener(local_host="127.0.0.1")
+    _, port = listener.extra(anyio.abc.SocketAttribute.local_address)
+    flow_file = tmp_path / "drain_flow.py"
+    flow_file.write_text(
+        "import os\n"
+        "import socket\n\n"
+        "from prefect import flow\n\n"
+        "@flow\n"
+        "def wait_for_release():\n"
+        '    with socket.create_connection(("127.0.0.1", int(os.environ["DRAIN_TEST_PORT"]))) as connection:\n'
+        "        connection.recv(1)\n"
+    )
+    deployment_id = await prefect_client.create_deployment(
+        flow_id=flow.id,
+        name=f"drain-process-worker-{uuid.uuid4()}",
+        work_pool_name=process_work_pool.name,
+        path=str(tmp_path),
+        entrypoint=f"{flow_file.name}:wait_for_release",
+        job_variables={"env": {"DRAIN_TEST_PORT": str(port)}},
+    )
+    flow_run = await prefect_client.create_flow_run_from_deployment(
+        deployment_id,
+        state=State(
+            type=client_schemas.StateType.SCHEDULED,
+            state_details=client_schemas.StateDetails(
+                scheduled_time=now("UTC") - timedelta(minutes=5)
+            ),
+        ),
+    )
+
+    worker = ProcessWorker(work_pool_name=process_work_pool.name)
+    child_started = anyio.Event()
+    release_child = anyio.Event()
+    worker_finished = anyio.Event()
+
+    async def start_worker() -> None:
+        await worker.start()
+        worker_finished.set()
+
+    async def hold_child_until_released(stream: anyio.abc.SocketStream) -> None:
+        async with stream:
+            child_started.set()
+            await release_child.wait()
+
+    async with listener, anyio.create_task_group() as task_group:
+        task_group.start_soon(listener.serve, hold_child_until_released)
+        task_group.start_soon(start_worker)
+        with anyio.fail_after(20):
+            await child_started.wait()
+
+        assert flow_run.id in worker._in_flight_flow_run_ids
+        worker.request_drain()
+        with anyio.move_on_after(0.1):
+            await worker_finished.wait()
+        assert not worker_finished.is_set()
+
+        release_child.set()
+        with anyio.fail_after(20):
+            await worker_finished.wait()
+
+        task_group.cancel_scope.cancel()
+
+
 @pytest.mark.parametrize("limit", [None, 1])
 async def test_process_worker_tracks_in_flight_runs_until_infrastructure_exits(
     process_work_pool: WorkPool,
