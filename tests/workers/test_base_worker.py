@@ -561,6 +561,42 @@ async def test_worker_with_work_pool_and_limit(
         )
 
 
+async def test_worker_stops_scheduling_runs_when_drain_is_requested(
+    prefect_client: PrefectClient,
+    worker_deployment_wq1: WorkQueue,
+    work_pool: WorkPool,
+):
+    def create_run_with_deployment(state: State):
+        return prefect_client.create_flow_run_from_deployment(
+            worker_deployment_wq1.id, state=state
+        )
+
+    for _ in range(2):
+        await create_run_with_deployment(
+            Scheduled(scheduled_time=now_fn("UTC") - timedelta(days=1))
+        )
+
+    async with WorkerTestImpl(work_pool_name=work_pool.name, limit=2) as worker:
+        flow_run_response = await worker._get_scheduled_flow_runs()
+        assert len(flow_run_response) == 2
+        runs_task_group = MagicMock()
+
+        def request_drain_after_first_submission(*args: Any):
+            worker.request_drain()
+
+        runs_task_group.start_soon.side_effect = request_drain_after_first_submission
+        worker._runs_task_group = runs_task_group
+
+        submitted_flow_runs = await worker._submit_scheduled_flow_runs(
+            flow_run_response
+        )
+
+        assert runs_task_group.start_soon.call_count == 1
+        assert submitted_flow_runs == [flow_run_response[0].flow_run]
+        assert worker._submitting_flow_run_ids == {flow_run_response[0].flow_run.id}
+        assert worker.limiter.borrowed_tokens == 1
+
+
 async def test_worker_calls_run_with_expected_arguments(
     prefect_client: PrefectClient,
     worker_deployment_wq1: WorkQueue,

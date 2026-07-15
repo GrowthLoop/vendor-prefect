@@ -1380,6 +1380,8 @@ class BaseWorker(abc.ABC, Generic[C, V, R]):
         submittable_flow_runs = [entry.flow_run for entry in flow_run_response]
 
         for flow_run in submittable_flow_runs:
+            if self._draining:
+                break
             if flow_run.id in self._submitting_flow_run_ids:
                 self._logger.debug(
                     f"Skipping {flow_run.id} because it's already being submitted"
