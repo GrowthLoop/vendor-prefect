@@ -613,7 +613,6 @@ class BaseWorker(abc.ABC, Generic[C, V, R]):
         self._limit = limit
         self._limiter: Optional[anyio.CapacityLimiter] = None
         self._submitting_flow_run_ids: set[UUID] = set()
-        self._active_flow_run_ids: set[UUID] = set()
         self._scheduled_task_scopes: set[anyio.CancelScope] = set()
         self._worker_metadata_sent = False
         self._draining = False
@@ -1175,6 +1174,11 @@ class BaseWorker(abc.ABC, Generic[C, V, R]):
         The instance property `self._last_polled_time`
         is currently set/updated in `get_and_submit_flow_runs()`
         """
+        # A draining worker intentionally stops polling while it waits for active
+        # flow runs to finish. It must remain healthy until that drain completes.
+        if self._draining:
+            return True
+
         threshold_seconds = query_interval_seconds * 30
 
         seconds_since_last_poll = (
@@ -1437,7 +1441,6 @@ class BaseWorker(abc.ABC, Generic[C, V, R]):
         Submits a given flow run for execution by the worker.
         """
         run_logger = self.get_flow_run_logger(flow_run)
-        self._active_flow_run_ids.add(flow_run.id)
         try:
             if flow_run.deployment_id:
                 try:
@@ -1496,7 +1499,6 @@ class BaseWorker(abc.ABC, Generic[C, V, R]):
             self._submitting_flow_run_ids.discard(flow_run.id)
             if self._cancelling_observer is not None:
                 self._cancelling_observer.remove_in_flight_flow_run_id(flow_run.id)
-            self._active_flow_run_ids.discard(flow_run.id)
 
     async def _submit_run_and_capture_errors(
         self,

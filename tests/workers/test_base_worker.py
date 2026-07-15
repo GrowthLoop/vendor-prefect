@@ -2186,6 +2186,9 @@ async def test_worker_last_polled_health_check(work_pool: WorkPool):
                 with travel_to(now + timedelta(minutes=30, seconds=1)):
                     resp = worker.is_worker_still_polling(query_interval_seconds=60)
                     assert resp is False
+
+                    worker.request_drain()
+                    assert worker.is_worker_still_polling(query_interval_seconds=60)
     except ExceptionGroup as e:
         raise e.exceptions[0]
 

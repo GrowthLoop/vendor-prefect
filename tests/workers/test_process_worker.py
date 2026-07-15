@@ -584,8 +584,20 @@ async def test_process_worker_start_drains_in_flight_subprocess(
 
     worker = ProcessWorker(work_pool_name=process_work_pool.name)
     child_started = anyio.Event()
+    heartbeat_started_after_drain = anyio.Event()
     release_child = anyio.Event()
     worker_finished = anyio.Event()
+
+    original_sync_with_backend = worker.sync_with_backend
+
+    async def sync_with_backend() -> None:
+        started_while_draining = worker._draining
+        await original_sync_with_backend()
+        if started_while_draining:
+            heartbeat_started_after_drain.set()
+
+    worker.sync_with_backend = sync_with_backend
+    worker.heartbeat_interval_seconds = 1
 
     async def start_worker() -> None:
         await worker.start()
@@ -604,6 +616,8 @@ async def test_process_worker_start_drains_in_flight_subprocess(
 
         assert flow_run.id in worker._in_flight_flow_run_ids
         worker.request_drain()
+        with anyio.fail_after(5):
+            await heartbeat_started_after_drain.wait()
         with anyio.move_on_after(0.1):
             await worker_finished.wait()
         assert not worker_finished.is_set()

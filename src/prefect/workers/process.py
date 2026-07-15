@@ -202,25 +202,8 @@ class ProcessWorker(
                 await worker.sync_with_backend()
                 # schedule the scheduled flow run polling loop
                 try:
-                    async with anyio.create_task_group() as loops_task_group:
-                        self._service_task_group = loops_task_group
-                        # if a drain was requested before the loops started, stop
-                        # polling immediately.
-                        if self._draining:
-                            loops_task_group.cancel_scope.cancel()
-
-                        loops_task_group.start_soon(
-                            partial(
-                                critical_service_loop,
-                                workload=self.get_and_submit_flow_runs,
-                                interval=PREFECT_WORKER_QUERY_SECONDS.value(),
-                                run_once=run_once,
-                                jitter_range=0.3,
-                                backoff=4,  # Up to ~1 minute interval during backoff
-                            )
-                        )
-                        # schedule the sync loop
-                        loops_task_group.start_soon(
+                    async with anyio.create_task_group() as heartbeat_task_group:
+                        heartbeat_task_group.start_soon(
                             partial(
                                 critical_service_loop,
                                 workload=self.sync_with_backend,
@@ -231,39 +214,64 @@ class ProcessWorker(
                             )
                         )
 
-                        self._started_event = await self._emit_worker_started_event()
+                        async with anyio.create_task_group() as polling_task_group:
+                            self._service_task_group = polling_task_group
+                            # If a drain was requested before the loops started, stop
+                            # polling immediately. Heartbeats remain active while runs drain.
+                            if self._draining:
+                                polling_task_group.cancel_scope.cancel()
 
-                        start_client_metrics_server()
-
-                        if with_healthcheck:
-                            from prefect.workers.server import build_healthcheck_server
-
-                            # we'll start the ASGI server in a separate thread so that
-                            # uvicorn does not block the main thread
-                            healthcheck_server = build_healthcheck_server(
-                                worker=worker,
-                                query_interval_seconds=PREFECT_WORKER_QUERY_SECONDS.value(),
+                            polling_task_group.start_soon(
+                                partial(
+                                    critical_service_loop,
+                                    workload=self.get_and_submit_flow_runs,
+                                    interval=PREFECT_WORKER_QUERY_SECONDS.value(),
+                                    run_once=run_once,
+                                    jitter_range=0.3,
+                                    backoff=4,  # Up to ~1 minute interval during backoff
+                                )
                             )
-                            healthcheck_thread = threading.Thread(
-                                name="healthcheck-server-thread",
-                                target=healthcheck_server.run,
-                                daemon=True,
+
+                            self._started_event = (
+                                await self._emit_worker_started_event()
                             )
-                            healthcheck_thread.start()
-                        printer(f"Worker {worker.name!r} started!")
+
+                            start_client_metrics_server()
+
+                            if with_healthcheck:
+                                from prefect.workers.server import (
+                                    build_healthcheck_server,
+                                )
+
+                                # we'll start the ASGI server in a separate thread so that
+                                # uvicorn does not block the main thread
+                                healthcheck_server = build_healthcheck_server(
+                                    worker=worker,
+                                    query_interval_seconds=PREFECT_WORKER_QUERY_SECONDS.value(),
+                                )
+                                healthcheck_thread = threading.Thread(
+                                    name="healthcheck-server-thread",
+                                    target=healthcheck_server.run,
+                                    daemon=True,
+                                )
+                                healthcheck_thread.start()
+                            printer(f"Worker {worker.name!r} started!")
+
+                        self._service_task_group = None
+
+                        # If we were asked to drain, wait for active runs to complete
+                        # before stopping heartbeats and exiting the worker process.
+                        if self._draining:
+                            await self._wait_for_in_flight_runs()
+                            heartbeat_task_group.cancel_scope.cancel()
+                        # If running once, wait for active runs to complete before exiting.
+                        elif run_once:
+                            await self._wait_for_in_flight_runs()
                 except asyncio.CancelledError:
                     if not self._draining:
                         raise
                 finally:
                     self._service_task_group = None
-
-                # If we were asked to drain, wait for active runs to complete before
-                # exiting the worker process.
-                if self._draining:
-                    await self._wait_for_in_flight_runs()
-                # If running once, wait for active runs to complete before exiting
-                if run_once:
-                    await self._wait_for_in_flight_runs()
         finally:
             stop_client_metrics_server()
 
