@@ -4072,7 +4072,7 @@ wheels = [
 
 [[package]]
 name = "prefect"
-version = "3.6.27+growthloop"
+version = "3.6.27+growthloop.3"
 source = { editable = "." }
 dependencies = [
     { name = "aiosqlite" },
