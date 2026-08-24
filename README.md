@@ -7,9 +7,29 @@
 > **Patch summary:** Adds `PREFECT_WORKER_DRAIN_ON_SIGTERM` support. When enabled, Prefect workers will gracefully drain (stop accepting new work and finish in-progress flow runs) upon receiving a `SIGTERM` signal instead of exiting immediately.
 >
 > **Building the wheel:**
+>
+> > **Prerequisites:** Node.js **22.13.0** (see `.nvmrc`); the rest of the toolchain is managed by `uv`.
+>
+> The wheel bundles both the v1 and v2 Prefect UI dashboard assets. Running `uv build --wheel` alone produces a wheel without these assets (roughly 1.8 MB instead of the expected size). To build a complete wheel:
+>
 > ```bash
-> uv build --wheel
+> # 1. Sync dev dependencies (installs prefect CLI and build tools)
+> uv sync --only-dev --locked
+>
+> # 2. Build the v1 UI assets
+> uv run prefect dev build-ui
+>
+> # 3. Build the v2 UI assets
+> cd ui-v2
+> npm ci
+> npm run build
+> cp -r dist ../src/prefect/server/ui-v2
+> cd ..
+>
+> # 4. Build the wheel
+> uv build --wheel --out-dir dist
 > ```
+>
 > The built wheel will be emitted to the `dist/` directory.
 
 <p align="center"><img src="https://github.com/PrefectHQ/prefect/assets/3407835/c654cbc6-63e8-4ada-a92a-efd2f8f24b85" width=1000></p>
