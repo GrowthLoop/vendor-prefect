@@ -13,8 +13,9 @@ from uuid import UUID, uuid4
 import anyio
 import pytest
 
-from prefect import Task, flow, tags, task
+from prefect import DoNotCache, Task, flow, tags, task
 from prefect.cache_policies import FLOW_PARAMETERS, INPUTS, TASK_SOURCE
+from prefect.events.clients import AssertingEventsClient
 from prefect.client.orchestration import PrefectClient, SyncPrefectClient
 from prefect.client.schemas import StateDetails
 from prefect.client.schemas.filters import TaskRunFilter, TaskRunFilterName
@@ -2331,6 +2332,293 @@ class TestCachePolicy:
 
         assert result == "bar"
         assert await fs.read_path("tmp-first")
+
+
+class TestDoNotCache:
+    """Prototype tests for the `DoNotCache` return wrapper (RD-276)."""
+
+    def test_ordinary_task_caches_sync(self):
+        calls = []
+
+        @task(
+            cache_key_fn=lambda *args, **kwargs: "dnc-ordinary-sync",
+            persist_result=True,
+        )
+        def first():
+            calls.append(None)
+            return random.randint(0, 10000)
+
+        first_state = first(return_state=True)
+        second_state = first(return_state=True)
+
+        assert len(calls) == 1, "Second invocation should have been cached"
+        assert first_state.name == "Completed"
+        assert second_state.name == "Cached"
+
+    async def test_ordinary_task_caches_async(self):
+        calls = []
+
+        @task(
+            cache_key_fn=lambda *args, **kwargs: "dnc-ordinary-async",
+            persist_result=True,
+        )
+        async def first():
+            calls.append(None)
+            return random.randint(0, 10000)
+
+        first_state = await first(return_state=True)
+        second_state = await first(return_state=True)
+
+        assert len(calls) == 1, "Second invocation should have been cached"
+        assert first_state.name == "Completed"
+        assert second_state.name == "Cached"
+
+    def test_do_not_cache_executes_every_invocation_sync(self):
+        calls = []
+
+        @task(
+            cache_key_fn=lambda *args, **kwargs: "dnc-sync",
+            persist_result=True,
+        )
+        def first():
+            calls.append(None)
+            return DoNotCache(42)
+
+        first_result = first()
+        second_result = first(return_state=True)
+
+        assert len(calls) == 2, "Second invocation should have executed again"
+        assert first_result == 42
+        assert second_result.is_completed()
+        assert second_result.name == "Completed"
+        assert second_result.result() == 42
+
+    async def test_do_not_cache_executes_every_invocation_async(self):
+        calls = []
+
+        @task(
+            cache_key_fn=lambda *args, **kwargs: "dnc-async",
+            persist_result=True,
+        )
+        async def first():
+            calls.append(None)
+            return DoNotCache(42)
+
+        first_result = await first()
+        second_result = await first(return_state=True)
+
+        assert len(calls) == 2, "Second invocation should have executed again"
+        assert first_result == 42
+        assert second_result.is_completed()
+        assert second_result.name == "Completed"
+        assert await second_result.result() == 42
+
+    async def test_do_not_cache_does_not_persist_result(self, tmp_path):
+        fs = LocalFileSystem(basepath=tmp_path)
+        await fs.save("dnc-local-fs")
+        calls = []
+
+        @task(persist_result=True, result_storage_key="dnc-no-record", result_storage=fs)
+        def first():
+            calls.append(None)
+            return DoNotCache(42)
+
+        state = first(return_state=True)
+
+        assert state.is_completed()
+        assert not Path(tmp_path, "dnc-no-record").exists(), (
+            "DoNotCache result was persisted"
+        )
+
+        # No cache record was written, so the same key executes again
+        assert first() == 42
+        assert len(calls) == 2
+
+    async def test_do_not_cache_state_result_is_unwrapped(self, prefect_client):
+        @task(persist_result=True, cache_key_fn=lambda *args, **kwargs: "dnc-state")
+        async def first():
+            return DoNotCache({"nested": "value"})
+
+        direct_result = await first()
+        state = await first(return_state=True)
+
+        assert direct_result == {"nested": "value"}
+        assert state.is_completed()
+        assert await state.result() == {"nested": "value"}
+
+    async def test_do_not_cache_commit_hook_still_runs(self):
+        hooks = []
+        calls = []
+
+        @task(
+            cache_key_fn=lambda *args, **kwargs: "dnc-hooks",
+            persist_result=True,
+        )
+        def first():
+            calls.append(None)
+            return DoNotCache(42)
+
+        @first.on_commit
+        def record_commit(txn):
+            hooks.append(txn)
+
+        assert first() == 42
+        assert first() == 42
+
+        assert len(calls) == 2, "Second invocation should have executed again"
+        assert len(hooks) == 2, "Commit hooks should still run for DoNotCache"
+
+    def test_do_not_cache_completed_event_does_not_advertise_result_metadata(
+        self, asserting_events_worker, reset_worker_events
+    ):
+        @task(persist_result=True)
+        def first():
+            return DoNotCache(42)
+
+        state = first(return_state=True)
+        assert state.is_completed()
+
+        asserting_events_worker.drain()
+        assert isinstance(asserting_events_worker._client, AssertingEventsClient)
+        completed = [
+            event
+            for event in asserting_events_worker._client.events
+            if event.event == "prefect.task-run.Completed"
+        ]
+        assert len(completed) == 1
+        data = completed[0].payload["validated_state"]["data"]
+        assert data is None, (
+            "DoNotCache Completed event advertised result metadata for a "
+            f"record that was never persisted: {data}"
+        )
+
+    async def test_do_not_cache_completed_event_does_not_advertise_result_metadata_async(
+        self, asserting_events_worker, reset_worker_events
+    ):
+        @task(persist_result=True)
+        async def first():
+            return DoNotCache(42)
+
+        state = await first(return_state=True)
+        assert state.is_completed()
+
+        await asserting_events_worker.drain()
+        assert isinstance(asserting_events_worker._client, AssertingEventsClient)
+        completed = [
+            event
+            for event in asserting_events_worker._client.events
+            if event.event == "prefect.task-run.Completed"
+        ]
+        assert len(completed) == 1
+        data = completed[0].payload["validated_state"]["data"]
+        assert data is None, (
+            "DoNotCache Completed event advertised result metadata for a "
+            f"record that was never persisted: {data}"
+        )
+
+    def test_ordinary_completed_event_advertises_persisted_result(
+        self, asserting_events_worker, reset_worker_events
+    ):
+        @task(persist_result=True)
+        def first():
+            return 42
+
+        state = first(return_state=True)
+        assert state.is_completed()
+
+        asserting_events_worker.drain()
+        assert isinstance(asserting_events_worker._client, AssertingEventsClient)
+        completed = [
+            event
+            for event in asserting_events_worker._client.events
+            if event.event == "prefect.task-run.Completed"
+        ]
+        assert len(completed) == 1
+        data = completed[0].payload["validated_state"]["data"]
+        assert data is not None, "Persisted result metadata missing from event"
+        assert data["storage_key"]
+
+    async def test_do_not_cache_api_state_does_not_reference_storage(
+        self, prefect_client, events_pipeline
+    ):
+        @task(persist_result=True)
+        async def first():
+            return DoNotCache(42)
+
+        @flow
+        async def pipeline():
+            return await first(return_state=True)
+
+        flow_state = await pipeline(return_state=True)
+        task_state = await flow_state.result()
+        task_run_id = task_state.state_details.task_run_id
+        await events_pipeline.process_events(dequeue_events=False)
+
+        api_states = await prefect_client.read_task_run_states(task_run_id)
+        api_state = api_states[-1]
+        assert api_state.is_completed()
+        assert api_state.data is None, (
+            "API state advertises result metadata for a record that was "
+            f"never persisted: {api_state.data}"
+        )
+        with pytest.raises(MissingResult):
+            await api_state.result()
+
+    async def test_do_not_cache_attached_state_return_preserves_upstream_state(self):
+        captured = []
+
+        @task(persist_result=True)
+        async def outer():
+            upstream_state = Completed(data=42)
+            upstream_state.state_details.task_run_id = uuid4()
+            captured.append(upstream_state)
+            return DoNotCache(upstream_state)
+
+        state = await outer(return_state=True)
+        assert state.is_completed()
+        result = await state.result()
+        assert result is captured[0], (
+            "DoNotCache wrapping an attached upstream state must preserve the "
+            f"state itself as the result, got {result!r}"
+        )
+        assert result.is_completed()
+        assert await result.result() == 42
+
+    async def test_do_not_cache_explicit_result_record_does_not_leak_metadata(
+        self, asserting_events_worker, reset_worker_events, tmp_path
+    ):
+        fs = LocalFileSystem(basepath=tmp_path)
+        await fs.save("dnc-explicit-record")
+        record = ResultStore(result_storage=fs).create_result_record(
+            "payload", key="dnc-explicit-record"
+        )
+
+        @task(persist_result=True)
+        async def first():
+            return DoNotCache(record)
+
+        direct_result = await first()
+        assert direct_result == "payload", (
+            "Direct call follows existing engine semantics: a ResultRecord "
+            "return value is unwrapped by engine.result()"
+        )
+
+        state = await first(return_state=True)
+        assert state.is_completed()
+        assert await state.result() == "payload"
+        assert isinstance(asserting_events_worker._client, AssertingEventsClient)
+        completed = [
+            event
+            for event in asserting_events_worker._client.events
+            if event.event == "prefect.task-run.Completed"
+        ]
+        assert completed, "Expected at least one Completed task-run event"
+        for event in completed:
+            data = event.payload["validated_state"]["data"]
+            assert data is None, (
+                "DoNotCache Completed event advertised metadata for an explicit "
+                f"never-persisted ResultRecord: {data}"
+            )
 
 
 class TestGenerators:

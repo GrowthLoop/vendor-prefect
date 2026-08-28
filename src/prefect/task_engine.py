@@ -105,7 +105,7 @@ from prefect.transactions import (
     transaction,
 )
 from prefect.utilities._engine import dynamic_key_for_task_run, get_hook_name
-from prefect.utilities.annotations import NotSet
+from prefect.utilities.annotations import DoNotCache, NotSet
 from prefect.utilities.asyncutils import run_coro_as_sync
 from prefect.utilities.callables import call_with_parameters, parameters_to_args_kwargs
 from prefect.utilities.collections import visit_collection
@@ -616,6 +616,27 @@ class SyncTaskRunEngine(BaseTaskRunEngine[P, R]):
     def handle_success(
         self, result: R, transaction: Transaction
     ) -> Union[ResultRecord[R], None, Coroutine[Any, Any, R], R]:
+        # Unwrap `DoNotCache` results: the caller still receives the value, but
+        # it must not be persisted or cached under the transaction key.
+        do_not_cache = isinstance(result, DoNotCache)
+        do_not_cache_data: Any = NotSet
+        if do_not_cache:
+            result = result.value
+            transaction.write_on_commit = False
+            if isinstance(result, State):
+                if (
+                    result.state_details.flow_run_id
+                    or result.state_details.task_run_id
+                ):
+                    # Attached upstream state: `return_value_to_state` treats
+                    # it as an aggregate value, so preserve the state itself.
+                    do_not_cache_data = result
+                else:
+                    # Manual state: `return_value_to_state` replaces its data
+                    # with a fresh record; snapshot it so the unpersisted data
+                    # can be restored below.
+                    do_not_cache_data = result.data
+
         # Handle the case where the task explicitly returns a failed state, in
         # which case we should retry the task if it has retries left.
         if isinstance(result, State) and result.is_failed():
@@ -633,6 +654,18 @@ class SyncTaskRunEngine(BaseTaskRunEngine[P, R]):
             key=transaction.key,
             expiration=expiration,
         )
+        if do_not_cache:
+            # The result is never persisted, so the terminal state must not
+            # carry a ResultRecord pointing at a storage key that will never
+            # exist. Raw data keeps local `state.result()` coherent and makes
+            # events and API payloads carry `data=None` (unpersisted
+            # semantics) instead of dangling result metadata.
+            payload = do_not_cache_data if do_not_cache_data is not NotSet else result
+            if isinstance(payload, ResultRecord):
+                # An explicit never-persisted record must not be advertised
+                # either; keep its unwrapped result as the terminal data.
+                payload = payload.result
+            terminal_state.data = payload
 
         # Avoid logging when running this rollback hook since it is not user-defined
         handle_rollback = partial(self.handle_rollback)
@@ -643,7 +676,7 @@ class SyncTaskRunEngine(BaseTaskRunEngine[P, R]):
             on_rollback_hooks=[handle_rollback] + self.task.on_rollback_hooks,
             on_commit_hooks=self.task.on_commit_hooks,
         )
-        if transaction.is_committed():
+        if transaction.is_committed() and not do_not_cache:
             terminal_state.name = "Cached"
 
         self.set_state(terminal_state)
@@ -1242,6 +1275,27 @@ class AsyncTaskRunEngine(BaseTaskRunEngine[P, R]):
     async def handle_success(
         self, result: R, transaction: AsyncTransaction
     ) -> Union[ResultRecord[R], None, Coroutine[Any, Any, R], R]:
+        # Unwrap `DoNotCache` results: the caller still receives the value, but
+        # it must not be persisted or cached under the transaction key.
+        do_not_cache = isinstance(result, DoNotCache)
+        do_not_cache_data: Any = NotSet
+        if do_not_cache:
+            result = result.value
+            transaction.write_on_commit = False
+            if isinstance(result, State):
+                if (
+                    result.state_details.flow_run_id
+                    or result.state_details.task_run_id
+                ):
+                    # Attached upstream state: `return_value_to_state` treats
+                    # it as an aggregate value, so preserve the state itself.
+                    do_not_cache_data = result
+                else:
+                    # Manual state: `return_value_to_state` replaces its data
+                    # with a fresh record; snapshot it so the unpersisted data
+                    # can be restored below.
+                    do_not_cache_data = result.data
+
         if isinstance(result, State) and result.is_failed():
             if await self.handle_retry(result):
                 return None
@@ -1258,6 +1312,19 @@ class AsyncTaskRunEngine(BaseTaskRunEngine[P, R]):
             expiration=expiration,
         )
 
+        if do_not_cache:
+            # The result is never persisted, so the terminal state must not
+            # carry a ResultRecord pointing at a storage key that will never
+            # exist. Raw data keeps local `state.result()` coherent and makes
+            # events and API payloads carry `data=None` (unpersisted
+            # semantics) instead of dangling result metadata.
+            payload = do_not_cache_data if do_not_cache_data is not NotSet else result
+            if isinstance(payload, ResultRecord):
+                # An explicit never-persisted record must not be advertised
+                # either; keep its unwrapped result as the terminal data.
+                payload = payload.result
+            terminal_state.data = payload
+
         # Avoid logging when running this rollback hook since it is not user-defined
         handle_rollback = partial(self.handle_rollback)
         handle_rollback.log_on_run = False
@@ -1267,7 +1334,7 @@ class AsyncTaskRunEngine(BaseTaskRunEngine[P, R]):
             on_rollback_hooks=[handle_rollback] + self.task.on_rollback_hooks,
             on_commit_hooks=self.task.on_commit_hooks,
         )
-        if transaction.is_committed():
+        if transaction.is_committed() and not do_not_cache:
             terminal_state.name = "Cached"
 
         await self.set_state(terminal_state)

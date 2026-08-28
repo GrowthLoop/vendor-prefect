@@ -6,7 +6,7 @@ from prefect.flows import FlowDecorator, flow, Flow, serve, aserve
 from prefect.transactions import Transaction
 from prefect.tasks import task, Task
 from prefect.context import tags
-from prefect.utilities.annotations import unmapped, allow_failure
+from prefect.utilities.annotations import DoNotCache, allow_failure, unmapped
 from prefect._result_records import ResultRecordMetadata
 from prefect.flow_runs import (
     apause_flow_run,
@@ -69,6 +69,7 @@ __all__ = [
     "aresume_flow_run",
     "aserve",
     "asuspend_flow_run",
+    "DoNotCache",
     "flow",
     "Flow",
     "get_client",

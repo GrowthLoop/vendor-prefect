@@ -146,6 +146,24 @@ class Quote(quote[T]):
         return super().__new__(cls, expr)
 
 
+class DoNotCache(BaseAnnotation[T]):
+    """
+    Wrapper for task return values that opt out of result caching and
+    persistence.
+
+    The task run completes normally and the caller receives the wrapped value,
+    but nothing is written for the task's cache key, so subsequent invocations
+    execute the task again instead of returning a cached result.
+
+    Example:
+        ```python
+        @task(cache_key_fn=lambda *args, **kwargs: "my-key", persist_result=True)
+        def fetch_token():
+            return DoNotCache(get_fresh_token())
+        ```
+    """
+
+
 class NotSet:
     """
     Singleton to distinguish `None` from a value that is not provided by the user.

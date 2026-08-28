@@ -17,6 +17,7 @@ from typing import (
     Awaitable,
     Callable,
     Coroutine,
+    Generator,
     Generic,
     Iterable,
     NoReturn,
@@ -69,7 +70,7 @@ from prefect.results import (
 )
 from prefect.settings.context import get_current_settings
 from prefect.states import Pending, Scheduled, State
-from prefect.utilities.annotations import NotSet
+from prefect.utilities.annotations import DoNotCache, NotSet
 from prefect.utilities.asyncutils import run_coro_as_sync
 from prefect.utilities.callables import (
     expand_mapping_parameters,
@@ -90,6 +91,9 @@ if TYPE_CHECKING:
 T = TypeVar("T")
 R = TypeVar("R")  # The return type of the user's function
 P = ParamSpec("P")  # The parameters of the task
+
+Y = TypeVar("Y")  # The yield type of a generator task's function
+S = TypeVar("S")  # The send type of a generator task's function
 
 NUM_CHARS_DYNAMIC_KEY = 8
 
@@ -1852,45 +1856,55 @@ class Task(Generic[P, R]):
         serve(self)
 
 
+# A task whose function returns `DoNotCache(...)` completes with the wrapped
+# value at runtime, so the resulting task is typed with the unwrapped type.
+@overload
+def task(__fn: Callable[P, DoNotCache[R]]) -> Task[P, R]: ...
+
+
+@overload
+def task(
+    __fn: Callable[P, Coroutine[Any, Any, DoNotCache[R]]],
+) -> Task[P, Coroutine[Any, Any, R]]: ...
+
+
+# A generator task whose function terminates with `return DoNotCache(...)`
+# unwraps the terminal value: run_generator_task_sync/run_generator_task_async
+# pass the `StopIteration.value` through `handle_success`, which unwraps the
+# wrapper. Yielded `DoNotCache` values are NOT unwrapped at runtime, so a
+# generator task whose yields are wrapped resolves through the generic
+# overload instead.
+@overload
+def task(
+    __fn: Callable[P, Generator[Y, S, DoNotCache[R]]],
+) -> Task[P, Generator[Y, S, R]]: ...
+
+
 @overload
 def task(__fn: Callable[P, R]) -> Task[P, R]: ...
 
 
-# see https://github.com/PrefectHQ/prefect/issues/16380
-@overload
-def task(
-    __fn: Literal[None] = None,
-    *,
-    name: Optional[str] = None,
-    description: Optional[str] = None,
-    tags: Optional[Iterable[str]] = None,
-    version: Optional[str] = None,
-    cache_policy: Union[CachePolicy, type[NotSet]] = NotSet,
-    cache_key_fn: Optional[
-        Callable[["TaskRunContext", dict[str, Any]], Optional[str]]
-    ] = None,
-    cache_expiration: Optional[datetime.timedelta] = None,
-    task_run_name: Optional[TaskRunNameValueOrCallable] = None,
-    retries: int = 0,
-    retry_delay_seconds: Union[
-        float, int, list[float], Callable[[int], list[float]], None
-    ] = None,
-    retry_jitter_factor: Optional[float] = None,
-    persist_result: Optional[bool] = None,
-    result_storage: Optional[ResultStorage] = None,
-    result_storage_key: Optional[str] = None,
-    result_serializer: Optional[ResultSerializer] = None,
-    cache_result_in_memory: bool = True,
-    timeout_seconds: Union[int, float, None] = None,
-    log_prints: Optional[bool] = None,
-    refresh_cache: Optional[bool] = None,
-    on_completion: Optional[list[StateHookCallable]] = None,
-    on_failure: Optional[list[StateHookCallable]] = None,
-    on_running: Optional[list[StateHookCallable]] = None,
-    retry_condition_fn: Optional[RetryConditionCallable] = None,
-    viz_return_value: Any = None,
-    asset_deps: Optional[list[Union[str, Asset]]] = None,
-) -> Callable[[Callable[P, R]], Task[P, R]]: ...
+# The decorator returned by configured `@task(...)` calls. Its overloads mirror
+# the bare `@task` overloads above so configured tasks are also typed with the
+# runtime result type. Note a generator function's yields keep any
+# `DoNotCache` wrappers at runtime, so generators resolve through the generic
+# overload unchanged.
+class ConfiguredTaskDecorator(Protocol):
+    @overload
+    def __call__(self, __fn: Callable[P, DoNotCache[R]], /) -> Task[P, R]: ...
+
+    @overload
+    def __call__(
+        self, __fn: Callable[P, Coroutine[Any, Any, DoNotCache[R]]], /
+    ) -> Task[P, Coroutine[Any, Any, R]]: ...
+
+    @overload
+    def __call__(
+        self, __fn: Callable[P, Generator[Y, S, DoNotCache[R]]], /
+    ) -> Task[P, Generator[Y, S, R]]: ...
+
+    @overload
+    def __call__(self, __fn: Callable[P, R], /) -> Task[P, R]: ...
 
 
 # see https://github.com/PrefectHQ/prefect/issues/16380
@@ -1927,7 +1941,44 @@ def task(
     retry_condition_fn: Optional[RetryConditionCallable] = None,
     viz_return_value: Any = None,
     asset_deps: Optional[list[Union[str, Asset]]] = None,
-) -> Callable[[Callable[P, R]], Task[P, R]]: ...
+) -> ConfiguredTaskDecorator: ...
+
+
+# see https://github.com/PrefectHQ/prefect/issues/16380
+@overload
+def task(
+    __fn: Literal[None] = None,
+    *,
+    name: Optional[str] = None,
+    description: Optional[str] = None,
+    tags: Optional[Iterable[str]] = None,
+    version: Optional[str] = None,
+    cache_policy: Union[CachePolicy, type[NotSet]] = NotSet,
+    cache_key_fn: Optional[
+        Callable[["TaskRunContext", dict[str, Any]], Optional[str]]
+    ] = None,
+    cache_expiration: Optional[datetime.timedelta] = None,
+    task_run_name: Optional[TaskRunNameValueOrCallable] = None,
+    retries: int = 0,
+    retry_delay_seconds: Union[
+        float, int, list[float], Callable[[int], list[float]], None
+    ] = None,
+    retry_jitter_factor: Optional[float] = None,
+    persist_result: Optional[bool] = None,
+    result_storage: Optional[ResultStorage] = None,
+    result_storage_key: Optional[str] = None,
+    result_serializer: Optional[ResultSerializer] = None,
+    cache_result_in_memory: bool = True,
+    timeout_seconds: Union[int, float, None] = None,
+    log_prints: Optional[bool] = None,
+    refresh_cache: Optional[bool] = None,
+    on_completion: Optional[list[StateHookCallable]] = None,
+    on_failure: Optional[list[StateHookCallable]] = None,
+    on_running: Optional[list[StateHookCallable]] = None,
+    retry_condition_fn: Optional[RetryConditionCallable] = None,
+    viz_return_value: Any = None,
+    asset_deps: Optional[list[Union[str, Asset]]] = None,
+) -> ConfiguredTaskDecorator: ...
 
 
 @overload  # TODO: do we need this overload?
@@ -1965,7 +2016,7 @@ def task(
     retry_condition_fn: Optional[RetryConditionCallable] = None,
     viz_return_value: Any = None,
     asset_deps: Optional[list[Union[str, Asset]]] = None,
-) -> Callable[[Callable[P, R]], Task[P, R]]: ...
+) -> ConfiguredTaskDecorator: ...
 
 
 def task(
