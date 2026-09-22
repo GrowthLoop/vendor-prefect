@@ -13,12 +13,17 @@ from opentelemetry import trace
 from prefect import flow
 from prefect.client.orchestration import PrefectClient
 from prefect.client.schemas import TaskRunResult
+from prefect.client.schemas.filters import TaskRunFilter, TaskRunFilterFlowRunId
+from prefect.client.schemas.objects import StateType
 from prefect.context import FlowRunContext
 from prefect.deployments import arun_deployment, run_deployment
 from prefect.flow_engine import run_flow_async
 from prefect.settings import (
     PREFECT_API_URL,
+    PREFECT_UI_URL,
+    temporary_settings,
 )
+from prefect.states import Completed, Failed
 from prefect.tasks import task
 from prefect.telemetry.run_telemetry import (
     LABELS_TRACEPARENT_KEY,
@@ -787,6 +792,423 @@ class TestArunDeployment:
         assert child_flow_run.parent_task_run_id is not None
         task_run = await prefect_client.read_task_run(child_flow_run.parent_task_run_id)
         assert task_run.flow_run_id == parent_state.state_details.flow_run_id
+
+
+class TestDedupPlaceholderMirroring:
+    """
+    Tests for labeling the placeholder task run that is orphaned when
+    `create_flow_run_from_deployment` deduplicates on an idempotency key.
+
+    On a dedup hit the returned flow run's `parent_task_run_id` points at the
+    *original* call's placeholder, so the placeholder created by this call is
+    never updated by the `UpdateSubflowParentTask` orchestration policy and
+    would remain `Pending` forever. These tests pin the labeling behavior.
+    """
+
+    @pytest.fixture
+    async def test_deployment(self, prefect_client: PrefectClient):
+        flow_name = f"dedup-{uuid4()}"
+        flow_id = await prefect_client.create_flow_from_name(flow_name)
+
+        deployment_id = await prefect_client.create_deployment(
+            name=f"dedup-deployment-{uuid4()}",
+            flow_id=flow_id,
+            parameter_openapi_schema={"type": "object", "properties": {}},
+        )
+        deployment = await prefect_client.read_deployment(deployment_id)
+
+        return deployment, flow_name
+
+    async def _read_deployment_placeholders(
+        self, prefect_client: PrefectClient, parent_flow_run_id
+    ):
+        task_runs = await prefect_client.read_task_runs(
+            task_run_filter=TaskRunFilter(
+                flow_run_id=TaskRunFilterFlowRunId(any_=[parent_flow_run_id])
+            )
+        )
+        return [
+            task_run
+            for task_run in task_runs
+            if task_run.task_key.startswith(
+                "prefect.deployments.flow_runs.run_deployment."
+            )
+        ]
+
+    async def _read_orphan(
+        self, prefect_client: PrefectClient, parent_flow_run_id, first_placeholder_id
+    ):
+        placeholders = await self._read_deployment_placeholders(
+            prefect_client, parent_flow_run_id
+        )
+        assert len(placeholders) == 2
+        return next(
+            task_run for task_run in placeholders if task_run.id != first_placeholder_id
+        )
+
+    async def test_failed_duplicate_mirrors_onto_second_placeholder(
+        self,
+        test_deployment,
+        use_hosted_api_server,
+        prefect_client: PrefectClient,
+    ):
+        deployment, flow_name = test_deployment
+        idempotency_key = f"dedup-failed-{uuid4()}"
+        first_placeholder_ids = {}
+
+        @flow(name=f"parent-{uuid4()}")
+        async def parent():
+            first = await arun_deployment(
+                f"{flow_name}/{deployment.name}",
+                idempotency_key=idempotency_key,
+                timeout=0,
+                poll_interval=0,
+                client=prefect_client,
+            )
+            first_placeholder_ids["value"] = first.parent_task_run_id
+            # Terminal-fail the run so the dedup hit returns a Failed duplicate
+            await prefect_client.set_flow_run_state(
+                first.id, Failed(message="original failure"), force=True
+            )
+            second = await arun_deployment(
+                f"{flow_name}/{deployment.name}",
+                idempotency_key=idempotency_key,
+                timeout=0,
+                poll_interval=0,
+                client=prefect_client,
+            )
+            return first, second
+
+        with temporary_settings({PREFECT_UI_URL: "http://test/ui"}):
+            parent_state = await parent(return_state=True)
+        first, second = await parent_state.result()
+        assert first.id == second.id
+
+        orphan = await self._read_orphan(
+            prefect_client,
+            parent_state.state_details.flow_run_id,
+            first_placeholder_ids["value"],
+        )
+        assert orphan.state.type == StateType.FAILED
+        assert idempotency_key in orphan.state.message
+        assert str(first.id) in orphan.state.message
+        assert f"http://test/ui/runs/flow-run/{first.id}" in orphan.state.message
+        assert orphan.state.state_details.child_flow_run_id == first.id
+
+    async def test_completed_duplicate_mirrors_onto_second_placeholder(
+        self,
+        test_deployment,
+        use_hosted_api_server,
+        prefect_client: PrefectClient,
+    ):
+        deployment, flow_name = test_deployment
+        idempotency_key = f"dedup-completed-{uuid4()}"
+        first_placeholder_ids = {}
+
+        @flow(name=f"parent-{uuid4()}")
+        async def parent():
+            first = await arun_deployment(
+                f"{flow_name}/{deployment.name}",
+                idempotency_key=idempotency_key,
+                timeout=0,
+                poll_interval=0,
+                client=prefect_client,
+            )
+            first_placeholder_ids["value"] = first.parent_task_run_id
+            await prefect_client.set_flow_run_state(
+                first.id, Completed(message="original success"), force=True
+            )
+            second = await arun_deployment(
+                f"{flow_name}/{deployment.name}",
+                idempotency_key=idempotency_key,
+                timeout=0,
+                poll_interval=0,
+                client=prefect_client,
+            )
+            return first, second
+
+        parent_state = await parent(return_state=True)
+        first, second = await parent_state.result()
+        assert first.id == second.id
+
+        orphan = await self._read_orphan(
+            prefect_client,
+            parent_state.state_details.flow_run_id,
+            first_placeholder_ids["value"],
+        )
+        assert orphan.state.type == StateType.COMPLETED
+        assert idempotency_key in orphan.state.message
+        assert orphan.state.state_details.child_flow_run_id == first.id
+
+    async def test_fresh_create_gets_no_client_state_write(
+        self,
+        test_deployment,
+        use_hosted_api_server,
+        prefect_client: PrefectClient,
+    ):
+        """
+        On a fresh (non-dedup) create, the client must not write placeholder
+        state: the server's UpdateSubflowParentTask policy mirrors the child's
+        state onto the placeholder. The placeholder therefore advances beyond
+        its initial PENDING without any client-side write.
+        """
+        deployment, flow_name = test_deployment
+        idempotency_key = f"fresh-{uuid4()}"
+
+        @flow(name=f"parent-{uuid4()}")
+        async def parent():
+            return await arun_deployment(
+                f"{flow_name}/{deployment.name}",
+                idempotency_key=idempotency_key,
+                timeout=0,
+                poll_interval=0,
+                client=prefect_client,
+            )
+
+        with mock.patch.object(
+            prefect_client,
+            "set_task_run_state",
+            wraps=prefect_client.set_task_run_state,
+        ) as spy:
+            parent_state = await parent(return_state=True)
+
+        run = await parent_state.result()
+        assert run.parent_task_run_id is not None
+        assert spy.call_count == 0
+
+        placeholders = await self._read_deployment_placeholders(
+            prefect_client, parent_state.state_details.flow_run_id
+        )
+        assert len(placeholders) == 1
+        assert placeholders[0].id == run.parent_task_run_id
+        # The child's initial Scheduled state is mirrored server-side.
+        assert placeholders[0].state.type == StateType.SCHEDULED
+
+    async def test_nonterminal_duplicate_left_pending_on_timeout_zero(
+        self,
+        test_deployment,
+        use_hosted_api_server,
+        prefect_client: PrefectClient,
+    ):
+        deployment, flow_name = test_deployment
+        idempotency_key = f"dedup-nonterminal-{uuid4()}"
+        first_placeholder_ids = {}
+
+        @flow(name=f"parent-{uuid4()}")
+        async def parent():
+            first = await arun_deployment(
+                f"{flow_name}/{deployment.name}",
+                idempotency_key=idempotency_key,
+                timeout=0,
+                poll_interval=0,
+                client=prefect_client,
+            )
+            first_placeholder_ids["value"] = first.parent_task_run_id
+            # Duplicate is still Scheduled: the placeholder must not be
+            # labeled with a terminal state it does not have yet.
+            second = await arun_deployment(
+                f"{flow_name}/{deployment.name}",
+                idempotency_key=idempotency_key,
+                timeout=0,
+                poll_interval=0,
+                client=prefect_client,
+            )
+            return first, second
+
+        parent_state = await parent(return_state=True)
+        first, second = await parent_state.result()
+        assert first.id == second.id
+
+        orphan = await self._read_orphan(
+            prefect_client,
+            parent_state.state_details.flow_run_id,
+            first_placeholder_ids["value"],
+        )
+        assert orphan.state.type == StateType.PENDING
+
+    async def test_poll_exit_mirrors_final_state_of_dedup_duplicate(
+        self,
+        test_deployment,
+        use_hosted_api_server,
+        prefect_client: PrefectClient,
+    ):
+        deployment, flow_name = test_deployment
+        idempotency_key = f"dedup-poll-{uuid4()}"
+
+        # First dispatch outside a flow: creates the run that later dedups.
+        first = await arun_deployment(
+            f"{flow_name}/{deployment.name}",
+            idempotency_key=idempotency_key,
+            timeout=0,
+            poll_interval=0,
+            client=prefect_client,
+        )
+        real = await prefect_client.read_flow_run(first.id)
+        base_payload = real.model_dump(mode="json")
+        scheduled_payload = {**base_payload, "state": {"type": "SCHEDULED"}}
+        completed_payload = {**base_payload, "state": {"type": "COMPLETED"}}
+
+        @flow(name=f"parent-{uuid4()}")
+        async def parent():
+            return await arun_deployment(
+                f"{flow_name}/{deployment.name}",
+                idempotency_key=idempotency_key,
+                timeout=None,
+                poll_interval=0,
+                client=prefect_client,
+            )
+
+        with respx.mock(
+            base_url=PREFECT_API_URL.value(),
+            assert_all_mocked=True,
+            assert_all_called=False,
+            using="httpx",
+        ) as router:
+            # Real server handles creation (and the dedup); only the polls are
+            # scripted so the duplicate is observed as non-terminal first.
+            flow_polls = router.request(
+                "GET", re.compile(PREFECT_API_URL.value() + "/flow_runs/.*")
+            ).mock(
+                side_effect=[
+                    Response(200, json=scheduled_payload),
+                    Response(200, json=completed_payload),
+                ]
+            )
+            router.route().pass_through()
+
+            parent_state = await parent(return_state=True)
+
+        second = await parent_state.result()
+        assert second.id == first.id
+        assert len(flow_polls.calls) == 2
+
+        placeholders = await self._read_deployment_placeholders(
+            prefect_client, parent_state.state_details.flow_run_id
+        )
+        assert len(placeholders) == 1
+        orphan = placeholders[0]
+        assert orphan.state.type == StateType.COMPLETED
+        assert idempotency_key in orphan.state.message
+        assert orphan.state.state_details.child_flow_run_id == first.id
+
+    async def test_as_subflow_false_creates_no_placeholder(
+        self,
+        test_deployment,
+        use_hosted_api_server,
+        prefect_client: PrefectClient,
+    ):
+        deployment, flow_name = test_deployment
+        idempotency_key = f"dedup-nosubflow-{uuid4()}"
+
+        @flow(name=f"parent-{uuid4()}")
+        async def parent():
+            first = await arun_deployment(
+                f"{flow_name}/{deployment.name}",
+                idempotency_key=idempotency_key,
+                timeout=0,
+                poll_interval=0,
+                as_subflow=False,
+                client=prefect_client,
+            )
+            second = await arun_deployment(
+                f"{flow_name}/{deployment.name}",
+                idempotency_key=idempotency_key,
+                timeout=0,
+                poll_interval=0,
+                as_subflow=False,
+                client=prefect_client,
+            )
+            return first, second
+
+        with mock.patch.object(
+            prefect_client,
+            "set_task_run_state",
+            wraps=prefect_client.set_task_run_state,
+        ) as spy:
+            parent_state = await parent(return_state=True)
+
+        first, second = await parent_state.result()
+        assert first.parent_task_run_id is None
+        assert second.parent_task_run_id is None
+        assert spy.call_count == 0
+
+        placeholders = await self._read_deployment_placeholders(
+            prefect_client, parent_state.state_details.flow_run_id
+        )
+        assert len(placeholders) == 0
+
+    @pytest.fixture
+    def test_deployment_sync(self, sync_prefect_client):
+        flow_name = f"dedup-sync-{uuid4()}"
+        flow_id = sync_prefect_client.create_flow_from_name(flow_name)
+
+        deployment_id = sync_prefect_client.create_deployment(
+            name=f"dedup-sync-deployment-{uuid4()}",
+            flow_id=flow_id,
+            parameter_openapi_schema={"type": "object", "properties": {}},
+        )
+        deployment = sync_prefect_client.read_deployment(deployment_id)
+
+        return deployment, flow_name
+
+    def test_sync_run_deployment_mirrors_failed_duplicate(
+        self,
+        sync_prefect_client,
+        test_deployment_sync,
+    ):
+        deployment, flow_name = test_deployment_sync
+        idempotency_key = f"dedup-sync-{uuid4()}"
+        first_placeholder_ids = {}
+
+        @flow(name=f"sync-parent-{uuid4()}")
+        def parent():
+            first = run_deployment(
+                f"{flow_name}/{deployment.name}",
+                idempotency_key=idempotency_key,
+                timeout=0,
+                poll_interval=0,
+                _sync=True,
+            )
+            first_placeholder_ids["value"] = first.parent_task_run_id
+            sync_prefect_client.set_flow_run_state(
+                first.id, Failed(message="original failure"), force=True
+            )
+            second = run_deployment(
+                f"{flow_name}/{deployment.name}",
+                idempotency_key=idempotency_key,
+                timeout=0,
+                poll_interval=0,
+                _sync=True,
+            )
+            return first, second
+
+        parent_state = parent(return_state=True)
+        first, second = parent_state.result()
+        assert first.id == second.id
+
+        task_runs = sync_prefect_client.read_task_runs(
+            task_run_filter=TaskRunFilter(
+                flow_run_id=TaskRunFilterFlowRunId(
+                    any_=[parent_state.state_details.flow_run_id]
+                )
+            )
+        )
+        placeholders = [
+            task_run
+            for task_run in task_runs
+            if task_run.task_key.startswith(
+                "prefect.deployments.flow_runs.run_deployment."
+            )
+        ]
+        assert len(placeholders) == 2
+        orphan = next(
+            task_run
+            for task_run in placeholders
+            if task_run.id != first_placeholder_ids["value"]
+        )
+        assert orphan.state.type == StateType.FAILED
+        assert idempotency_key in orphan.state.message
+        assert orphan.state.state_details.child_flow_run_id == first.id
 
 
 class TestRunDeploymentSyncContext:
