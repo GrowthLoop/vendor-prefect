@@ -1,3 +1,4 @@
+import logging
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Iterable, Optional, Union
 from uuid import UUID
@@ -10,6 +11,7 @@ from prefect._internal.compatibility.async_dispatch import async_dispatch
 from prefect._result_records import ResultRecordMetadata
 from prefect.client.orchestration import get_client
 from prefect.client.schemas import FlowRun, TaskRun, TaskRunResult
+from prefect.client.schemas.actions import LogCreate
 from prefect.client.schemas.objects import State, StateType
 from prefect.client.utilities import get_or_create_client
 from prefect.context import FlowRunContext, TaskRunContext
@@ -114,6 +116,52 @@ def _dedup_orphan_placeholder_name(flow_run: "FlowRun") -> str:
     return f"Idempotent dedupe: {flow_run.name}"
 
 
+def _dedup_orphan_log(
+    flow_run: "FlowRun",
+    idempotency_key: Optional[str],
+) -> "LogCreate":
+    """
+    Build the log record attached to an orphaned placeholder task run so its
+    Logs tab explains the dedup (the run is never executed, so no engine
+    would otherwise log anything for it).
+    """
+    state_type = flow_run.state.type if flow_run.state else None
+    base = (
+        "Idempotent dedupe: this dispatch resolved to existing flow run "
+        f"{flow_run.name!r} ({flow_run.id})"
+    )
+    child_url = url_for("flow-run", obj_id=flow_run.id)
+    url = f" See {child_url}." if child_url else ""
+
+    if state_type in _TERMINAL_FAILURE_STATES:
+        level = logging.WARNING
+        message = (
+            f"{base}, which is {state_type.value}. This placeholder task run "
+            f"mirrors that outcome. Idempotency key: {idempotency_key!r}.{url}"
+        )
+    elif state_type is StateType.COMPLETED:
+        level = logging.INFO
+        message = (
+            f"{base}, which completed. This placeholder task run mirrors that "
+            f"outcome. Idempotency key: {idempotency_key!r}.{url}"
+        )
+    else:
+        level = logging.INFO
+        message = (
+            f"{base}, currently in state "
+            f"{state_type.value if state_type else 'unknown'}. Its terminal "
+            f"outcome will be mirrored here. "
+            f"Idempotency key: {idempotency_key!r}.{url}"
+        )
+
+    return LogCreate(
+        name="prefect.flow_runs",
+        level=level,
+        message=message,
+        timestamp=now("UTC"),
+    )
+
+
 async def _rename_dedup_placeholder(
     client: "PrefectClient",
     parent_task_run: "TaskRun",
@@ -151,6 +199,52 @@ def _rename_dedup_placeholder_sync(
     except Exception:
         logger.warning(
             "Failed to rename deduplicated placeholder task run %s",
+            parent_task_run.id,
+            exc_info=True,
+        )
+
+
+async def _log_dedup_orphan(
+    client: "PrefectClient",
+    parent_task_run: "TaskRun",
+    flow_run: "FlowRun",
+    idempotency_key: Optional[str],
+) -> None:
+    """
+    Async twin of `_log_dedup_orphan_sync`. Best effort: failures are logged
+    and the placeholder's Logs tab simply stays empty.
+    """
+    try:
+        record = _dedup_orphan_log(flow_run, idempotency_key)
+        record.flow_run_id = parent_task_run.flow_run_id
+        record.task_run_id = parent_task_run.id
+        await client.create_logs([record])
+    except Exception:
+        logger.warning(
+            "Failed to create dedup log for placeholder task run %s",
+            parent_task_run.id,
+            exc_info=True,
+        )
+
+
+def _log_dedup_orphan_sync(
+    client: "SyncPrefectClient",
+    parent_task_run: "TaskRun",
+    flow_run: "FlowRun",
+    idempotency_key: Optional[str],
+) -> None:
+    """
+    Sync twin of `_log_dedup_orphan`. Best effort: failures are logged and
+    the placeholder's Logs tab simply stays empty.
+    """
+    try:
+        record = _dedup_orphan_log(flow_run, idempotency_key)
+        record.flow_run_id = parent_task_run.flow_run_id
+        record.task_run_id = parent_task_run.id
+        client.create_logs([record])
+    except Exception:
+        logger.warning(
+            "Failed to create dedup log for placeholder task run %s",
             parent_task_run.id,
             exc_info=True,
         )
@@ -400,6 +494,7 @@ async def arun_deployment(
         # onto and label it with the duplicate's final state instead of
         # leaving it Pending forever.
         await _rename_dedup_placeholder(client, parent_task_run, flow_run)
+        await _log_dedup_orphan(client, parent_task_run, flow_run, idempotency_key)
         mirrored = await _mirror_dedup_placeholder_state(
             client, parent_task_run, flow_run, idempotency_key
         )
@@ -615,6 +710,9 @@ def run_deployment(
         )
         if is_dedup:
             _rename_dedup_placeholder_sync(sync_client, parent_task_run, flow_run)
+            _log_dedup_orphan_sync(
+                sync_client, parent_task_run, flow_run, idempotency_key
+            )
             mirrored = _mirror_dedup_placeholder_state_sync(
                 sync_client, parent_task_run, flow_run, idempotency_key
             )

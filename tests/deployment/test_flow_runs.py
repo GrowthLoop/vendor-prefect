@@ -1,4 +1,5 @@
 import inspect
+import logging
 import re
 from datetime import timedelta
 from typing import TYPE_CHECKING
@@ -13,7 +14,12 @@ from opentelemetry import trace
 from prefect import flow
 from prefect.client.orchestration import PrefectClient
 from prefect.client.schemas import TaskRunResult
-from prefect.client.schemas.filters import TaskRunFilter, TaskRunFilterFlowRunId
+from prefect.client.schemas.filters import (
+    LogFilter,
+    LogFilterFlowRunId,
+    TaskRunFilter,
+    TaskRunFilterFlowRunId,
+)
 from prefect.client.schemas.objects import StateType
 from prefect.context import FlowRunContext
 from prefect.deployments import arun_deployment, run_deployment
@@ -896,6 +902,20 @@ class TestDedupPlaceholderMirroring:
         assert orphan.state.state_details.child_flow_run_id == first.id
         assert orphan.name == f"Idempotent dedupe: {first.name}"
 
+        logs = await prefect_client.read_logs(
+            log_filter=LogFilter(
+                flow_run_id=LogFilterFlowRunId(
+                    any_=[parent_state.state_details.flow_run_id]
+                )
+            )
+        )
+        orphan_logs = [log for log in logs if log.task_run_id == orphan.id]
+        assert orphan_logs, "expected a log record on the orphaned placeholder"
+        assert orphan_logs[0].level == logging.WARNING
+        assert "Idempotent dedupe" in orphan_logs[0].message
+        assert idempotency_key in orphan_logs[0].message
+        assert first.name in orphan_logs[0].message
+
     async def test_completed_duplicate_mirrors_onto_second_placeholder(
         self,
         test_deployment,
@@ -1032,6 +1052,18 @@ class TestDedupPlaceholderMirroring:
         # Renaming is clarity-only and applies even when the duplicate has
         # no labelable terminal state yet.
         assert orphan.name == f"Idempotent dedupe: {first.name}"
+
+        logs = await prefect_client.read_logs(
+            log_filter=LogFilter(
+                flow_run_id=LogFilterFlowRunId(
+                    any_=[parent_state.state_details.flow_run_id]
+                )
+            )
+        )
+        orphan_logs = [log for log in logs if log.task_run_id == orphan.id]
+        assert orphan_logs, "expected a log record on the orphaned placeholder"
+        assert orphan_logs[0].level == logging.INFO
+        assert "will be mirrored here" in orphan_logs[0].message
 
     async def test_poll_exit_mirrors_final_state_of_dedup_duplicate(
         self,
@@ -1275,6 +1307,18 @@ class TestDedupPlaceholderMirroring:
         assert idempotency_key in orphan.state.message
         assert orphan.state.state_details.child_flow_run_id == first.id
         assert orphan.name == f"Idempotent dedupe: {first.name}"
+
+        logs = sync_prefect_client.read_logs(
+            log_filter=LogFilter(
+                flow_run_id=LogFilterFlowRunId(
+                    any_=[parent_state.state_details.flow_run_id]
+                )
+            )
+        )
+        orphan_logs = [log for log in logs if log.task_run_id == orphan.id]
+        assert orphan_logs, "expected a log record on the orphaned placeholder"
+        assert orphan_logs[0].level == logging.WARNING
+        assert "Idempotent dedupe" in orphan_logs[0].message
 
 
 class TestRunDeploymentSyncContext:
