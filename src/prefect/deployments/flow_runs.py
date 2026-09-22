@@ -131,28 +131,35 @@ def _dedup_orphan_log(
         f"{flow_run.name!r} ({flow_run.id})"
     )
     child_url = url_for("flow-run", obj_id=flow_run.id)
-    url = f" See {child_url}." if child_url else ""
 
-    if state_type in _TERMINAL_FAILURE_STATES:
-        level = logging.WARNING
-        message = (
-            f"{base}, which is {state_type.value}. This placeholder task run "
-            f"mirrors that outcome. Idempotency key: {idempotency_key!r}.{url}"
-        )
-    elif state_type is StateType.COMPLETED:
-        level = logging.INFO
-        message = (
-            f"{base}, which completed. This placeholder task run mirrors that "
-            f"outcome. Idempotency key: {idempotency_key!r}.{url}"
-        )
+    if child_url:
+        if state_type in _TERMINAL_FAILURE_STATES:
+            level = logging.WARNING
+            message = (
+                f"{base}, which is {state_type.value}. This placeholder task "
+                f"run mirrors that outcome. See {child_url}. Idempotency "
+                f"key: {idempotency_key!r}."
+            )
+        elif state_type is StateType.COMPLETED:
+            level = logging.INFO
+            message = (
+                f"{base}, which completed. This placeholder task run mirrors "
+                f"that outcome. See {child_url}. Idempotency key: "
+                f"{idempotency_key!r}."
+            )
+        else:
+            level = logging.INFO
+            message = (
+                f"{base}, currently in state "
+                f"{state_type.value if state_type else 'unknown'}. Its "
+                f"terminal outcome will be mirrored here. See {child_url}. "
+                f"Idempotency key: {idempotency_key!r}."
+            )
     else:
-        level = logging.INFO
-        message = (
-            f"{base}, currently in state "
-            f"{state_type.value if state_type else 'unknown'}. Its terminal "
-            f"outcome will be mirrored here. "
-            f"Idempotency key: {idempotency_key!r}.{url}"
+        level = (
+            logging.WARNING if state_type in _TERMINAL_FAILURE_STATES else logging.INFO
         )
+        message = f"{base}. Idempotency key: {idempotency_key!r}."
 
     return LogCreate(
         name="prefect.flow_runs",
