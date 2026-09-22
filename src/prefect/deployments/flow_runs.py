@@ -68,7 +68,8 @@ def _dedup_orphan_state(
     placeholder created by *this* call is never updated by the
     `UpdateSubflowParentTask` orchestration policy and would otherwise remain
     `Pending` forever. The built state labels the orphaned placeholder with
-    the terminal state of the duplicate so the UI graph reflects the outcome.
+    the terminal state of the duplicate, records the duplicate as its child
+    in state details, and includes the duplicate's UI URL when configured.
     Non-terminal duplicates are left as-is; no child run is ever modified.
     """
     duplicate_state = flow_run.state
@@ -94,8 +95,9 @@ def _dedup_orphan_state(
         # Not terminal (Scheduled/Running/etc.): leave the placeholder alone.
         return None
 
-    # Link the placeholder node to the duplicate run in the UI graph, the way
-    # `UpdateSubflowParentTask` does for a non-deduplicated subflow.
+    # Record the duplicate as the placeholder's child in state details, the
+    # same field `UpdateSubflowParentTask` writes for a non-deduplicated
+    # subflow, and include its UI URL when configured.
     mirrored.state_details.child_flow_run_id = flow_run.id
     child_url = url_for("flow-run", obj_id=flow_run.id)
     if child_url:
@@ -338,13 +340,12 @@ async def arun_deployment(
 
     is_dedup = (
         parent_task_run_id is not None
-        and flow_run.created is not None
-        and flow_run.created < parent_task_run.created
+        and flow_run.parent_task_run_id != parent_task_run_id
     )
     if is_dedup:
         # The server deduplicated on (flow_id, idempotency_key): the returned
-        # run's parent_task_run_id points at the original call's placeholder,
-        # so the one created above will never be updated by the subflow
+        # run is attached to a different placeholder (the original call's), so
+        # the one created above will never be updated by the subflow
         # state-mirroring policy. Label it with the duplicate's final state
         # instead of leaving it Pending forever.
         mirrored = await _mirror_dedup_placeholder_state(
@@ -558,8 +559,7 @@ def run_deployment(
 
         is_dedup = (
             parent_task_run_id is not None
-            and flow_run.created is not None
-            and flow_run.created < parent_task_run.created
+            and flow_run.parent_task_run_id != parent_task_run_id
         )
         if is_dedup:
             mirrored = _mirror_dedup_placeholder_state_sync(

@@ -1066,8 +1066,8 @@ class TestDedupPlaceholderMirroring:
         ) as router:
             # Real server handles creation (and the dedup); only the polls are
             # scripted so the duplicate is observed as non-terminal first.
-            flow_polls = router.request(
-                "GET", re.compile(PREFECT_API_URL.value() + "/flow_runs/.*")
+            flow_polls = router.get(
+                f"{PREFECT_API_URL.value()}/flow_runs/{first.id}"
             ).mock(
                 side_effect=[
                     Response(200, json=scheduled_payload),
@@ -1090,6 +1090,64 @@ class TestDedupPlaceholderMirroring:
         assert orphan.state.type == StateType.COMPLETED
         assert idempotency_key in orphan.state.message
         assert orphan.state.state_details.child_flow_run_id == first.id
+
+    async def test_concurrent_dedup_mirrors_even_when_child_is_newer(
+        self,
+        test_deployment,
+        use_hosted_api_server,
+        prefect_client: PrefectClient,
+    ):
+        """
+        Regression: a concurrent caller can win the idempotency race *after*
+        this call's placeholder exists. The returned child is then NEWER than
+        the placeholder it does not own, so creation-time ordering cannot
+        detect the dedup; only the parent-ID mismatch can.
+        """
+        deployment, flow_name = test_deployment
+        idempotency_key = f"dedup-race-{uuid4()}"
+        real_create = prefect_client.create_flow_run_from_deployment
+
+        async def winning_concurrent_call(deployment_id, **kwargs):
+            # Simulate a concurrent caller that wins the idempotency race
+            # while this call is between placeholder creation and flow-run
+            # creation: the child is attached to a different (implicit,
+            # nonexistent here) parent and is created after our placeholder.
+            flow_run = await real_create(
+                deployment_id, idempotency_key=kwargs["idempotency_key"]
+            )
+            await prefect_client.set_flow_run_state(
+                flow_run.id, Failed(message="concurrent failure"), force=True
+            )
+            return await real_create(deployment_id, **kwargs)
+
+        @flow(name=f"parent-{uuid4()}")
+        async def parent():
+            with mock.patch.object(
+                prefect_client,
+                "create_flow_run_from_deployment",
+                side_effect=winning_concurrent_call,
+            ):
+                return await arun_deployment(
+                    f"{flow_name}/{deployment.name}",
+                    idempotency_key=idempotency_key,
+                    timeout=0,
+                    poll_interval=0,
+                    client=prefect_client,
+                )
+
+        parent_state = await parent(return_state=True)
+        run = await parent_state.result()
+
+        placeholders = await self._read_deployment_placeholders(
+            prefect_client, parent_state.state_details.flow_run_id
+        )
+        assert len(placeholders) == 1
+        orphan = placeholders[0]
+        assert run.parent_task_run_id != orphan.id
+        assert orphan.created < run.created
+        assert orphan.state.type == StateType.FAILED
+        assert idempotency_key in orphan.state.message
+        assert orphan.state.state_details.child_flow_run_id == run.id
 
     async def test_as_subflow_false_creates_no_placeholder(
         self,
