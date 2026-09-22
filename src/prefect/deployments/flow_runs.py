@@ -111,7 +111,7 @@ def _dedup_orphan_placeholder_name(flow_run: "FlowRun") -> str:
     Name for a placeholder task run that was orphaned by an idempotency dedup:
     it identifies the flow run the dispatch was deduplicated onto.
     """
-    return f"duplicate-of-{flow_run.name}"
+    return f"Idempotent dedupe: {flow_run.name}"
 
 
 async def _rename_dedup_placeholder(
