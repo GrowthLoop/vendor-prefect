@@ -9,17 +9,19 @@ import prefect
 from prefect._internal.compatibility.async_dispatch import async_dispatch
 from prefect._result_records import ResultRecordMetadata
 from prefect.client.orchestration import get_client
-from prefect.client.schemas import FlowRun, TaskRunResult
+from prefect.client.schemas import FlowRun, TaskRun, TaskRunResult
+from prefect.client.schemas.objects import State, StateType
 from prefect.client.utilities import get_or_create_client
 from prefect.context import FlowRunContext, TaskRunContext
 from prefect.logging import get_logger
-from prefect.states import Pending, Scheduled
+from prefect.states import Completed, Failed, Pending, Scheduled
 from prefect.tasks import Task
 from prefect.telemetry.run_telemetry import LABELS_TRACEPARENT_KEY, RunTelemetry
 from prefect.types._datetime import now
 from prefect.utilities._engine import dynamic_key_for_task_run
 from prefect.utilities.engine import collect_task_run_inputs_sync
 from prefect.utilities.slugify import slugify
+from prefect.utilities.urls import url_for
 
 
 def _is_instrumentation_enabled() -> bool:
@@ -32,7 +34,7 @@ def _is_instrumentation_enabled() -> bool:
 
 
 if TYPE_CHECKING:
-    from prefect.client.orchestration import PrefectClient
+    from prefect.client.orchestration import PrefectClient, SyncPrefectClient
     from prefect.client.schemas.objects import FlowRun
 
 prefect.client.schemas.StateCreate.model_rebuild(
@@ -46,6 +48,114 @@ if TYPE_CHECKING:
     import logging
 
 logger: "logging.Logger" = get_logger(__name__)
+
+
+_TERMINAL_FAILURE_STATES = frozenset({StateType.FAILED, StateType.CRASHED})
+
+
+def _dedup_orphan_state(
+    flow_run: "FlowRun",
+    idempotency_key: Optional[str],
+) -> Optional["State"]:
+    """
+    Build the state used to label a placeholder task run that was orphaned by
+    an idempotency dedup, or None when the duplicate is not in a labelable
+    terminal state.
+
+    When `create_flow_run_from_deployment` hits the server's
+    `(flow_id, idempotency_key)` uniqueness constraint, the returned flow run's
+    `parent_task_run_id` points at the *original* call's placeholder. The
+    placeholder created by *this* call is never updated by the
+    `UpdateSubflowParentTask` orchestration policy and would otherwise remain
+    `Pending` forever. The built state labels the orphaned placeholder with
+    the terminal state of the duplicate so the UI graph reflects the outcome.
+    Non-terminal duplicates are left as-is; no child run is ever modified.
+    """
+    duplicate_state = flow_run.state
+    if duplicate_state is None:
+        return None
+
+    if duplicate_state.type in _TERMINAL_FAILURE_STATES:
+        mirrored = Failed(
+            message=(
+                f"Duplicate run resolved by idempotency key {idempotency_key!r}: "
+                f"flow run {flow_run.name} ({flow_run.id}) is "
+                f"{duplicate_state.type.value}."
+            ),
+        )
+    elif duplicate_state.type is StateType.COMPLETED:
+        mirrored = Completed(
+            message=(
+                f"Duplicate run resolved by idempotency key {idempotency_key!r}: "
+                f"flow run {flow_run.name} ({flow_run.id}) completed."
+            ),
+        )
+    else:
+        # Not terminal (Scheduled/Running/etc.): leave the placeholder alone.
+        return None
+
+    # Link the placeholder node to the duplicate run in the UI graph, the way
+    # `UpdateSubflowParentTask` does for a non-deduplicated subflow.
+    mirrored.state_details.child_flow_run_id = flow_run.id
+    child_url = url_for("flow-run", obj_id=flow_run.id)
+    if child_url:
+        mirrored.message += f" See {child_url}."
+
+    return mirrored
+
+
+async def _mirror_dedup_placeholder_state(
+    client: "PrefectClient",
+    parent_task_run: "TaskRun",
+    flow_run: "FlowRun",
+    idempotency_key: Optional[str],
+) -> bool:
+    """
+    Async twin of `_mirror_dedup_placeholder_state_sync`. Returns True if a
+    state was written to the placeholder.
+    """
+    mirrored = _dedup_orphan_state(flow_run, idempotency_key)
+    if mirrored is None:
+        return False
+    try:
+        await client.set_task_run_state(parent_task_run.id, mirrored, force=True)
+    except Exception:
+        logger.warning(
+            "Failed to mirror deduplicated subflow state onto placeholder task "
+            "run %s for flow run %s",
+            parent_task_run.id,
+            flow_run.id,
+            exc_info=True,
+        )
+        return False
+    return True
+
+
+def _mirror_dedup_placeholder_state_sync(
+    client: "SyncPrefectClient",
+    parent_task_run: "TaskRun",
+    flow_run: "FlowRun",
+    idempotency_key: Optional[str],
+) -> bool:
+    """
+    Sync twin of `_mirror_dedup_placeholder_state`. Returns True if a state
+    was written to the placeholder.
+    """
+    mirrored = _dedup_orphan_state(flow_run, idempotency_key)
+    if mirrored is None:
+        return False
+    try:
+        client.set_task_run_state(parent_task_run.id, mirrored, force=True)
+    except Exception:
+        logger.warning(
+            "Failed to mirror deduplicated subflow state onto placeholder task "
+            "run %s for flow run %s",
+            parent_task_run.id,
+            flow_run.id,
+            exc_info=True,
+        )
+        return False
+    return True
 
 
 async def arun_deployment(
@@ -226,6 +336,23 @@ async def arun_deployment(
 
     flow_run_id = flow_run.id
 
+    is_dedup = (
+        parent_task_run_id is not None
+        and flow_run.created is not None
+        and flow_run.created < parent_task_run.created
+    )
+    if is_dedup:
+        # The server deduplicated on (flow_id, idempotency_key): the returned
+        # run's parent_task_run_id points at the original call's placeholder,
+        # so the one created above will never be updated by the subflow
+        # state-mirroring policy. Label it with the duplicate's final state
+        # instead of leaving it Pending forever.
+        mirrored = await _mirror_dedup_placeholder_state(
+            client, parent_task_run, flow_run, idempotency_key
+        )
+    else:
+        mirrored = False
+
     if timeout == 0:
         return flow_run
 
@@ -234,6 +361,10 @@ async def arun_deployment(
             flow_run = await client.read_flow_run(flow_run_id)
             flow_state = flow_run.state
             if flow_state and flow_state.is_final():
+                if is_dedup and not mirrored:
+                    mirrored = await _mirror_dedup_placeholder_state(
+                        client, parent_task_run, flow_run, idempotency_key
+                    )
                 return flow_run
             await anyio.sleep(poll_interval)
 
@@ -425,6 +556,18 @@ def run_deployment(
 
         flow_run_id = flow_run.id
 
+        is_dedup = (
+            parent_task_run_id is not None
+            and flow_run.created is not None
+            and flow_run.created < parent_task_run.created
+        )
+        if is_dedup:
+            mirrored = _mirror_dedup_placeholder_state_sync(
+                sync_client, parent_task_run, flow_run, idempotency_key
+            )
+        else:
+            mirrored = False
+
         if timeout == 0:
             return flow_run
 
@@ -435,6 +578,10 @@ def run_deployment(
             flow_run = sync_client.read_flow_run(flow_run_id)
             flow_state = flow_run.state
             if flow_state and flow_state.is_final():
+                if is_dedup and not mirrored:
+                    mirrored = _mirror_dedup_placeholder_state_sync(
+                        sync_client, parent_task_run, flow_run, idempotency_key
+                    )
                 return flow_run
             if timeout is not None and (time.monotonic() - start_time) >= timeout:
                 return flow_run
