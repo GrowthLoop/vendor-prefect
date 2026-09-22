@@ -106,6 +106,56 @@ def _dedup_orphan_state(
     return mirrored
 
 
+def _dedup_orphan_placeholder_name(flow_run: "FlowRun") -> str:
+    """
+    Name for a placeholder task run that was orphaned by an idempotency dedup:
+    it identifies the flow run the dispatch was deduplicated onto.
+    """
+    return f"duplicate-of-{flow_run.name}"
+
+
+async def _rename_dedup_placeholder(
+    client: "PrefectClient",
+    parent_task_run: "TaskRun",
+    flow_run: "FlowRun",
+) -> None:
+    """
+    Async twin of `_rename_dedup_placeholder_sync`. Best effort: failures are
+    logged and the placeholder keeps its generated name.
+    """
+    try:
+        await client.set_task_run_name(
+            parent_task_run.id, _dedup_orphan_placeholder_name(flow_run)
+        )
+    except Exception:
+        logger.warning(
+            "Failed to rename deduplicated placeholder task run %s",
+            parent_task_run.id,
+            exc_info=True,
+        )
+
+
+def _rename_dedup_placeholder_sync(
+    client: "SyncPrefectClient",
+    parent_task_run: "TaskRun",
+    flow_run: "FlowRun",
+) -> None:
+    """
+    Sync twin of `_rename_dedup_placeholder`. Best effort: failures are logged
+    and the placeholder keeps its generated name.
+    """
+    try:
+        client.set_task_run_name(
+            parent_task_run.id, _dedup_orphan_placeholder_name(flow_run)
+        )
+    except Exception:
+        logger.warning(
+            "Failed to rename deduplicated placeholder task run %s",
+            parent_task_run.id,
+            exc_info=True,
+        )
+
+
 async def _mirror_dedup_placeholder_state(
     client: "PrefectClient",
     parent_task_run: "TaskRun",
@@ -346,8 +396,10 @@ async def arun_deployment(
         # The server deduplicated on (flow_id, idempotency_key): the returned
         # run is attached to a different placeholder (the original call's), so
         # the one created above will never be updated by the subflow
-        # state-mirroring policy. Label it with the duplicate's final state
-        # instead of leaving it Pending forever.
+        # state-mirroring policy. Rename it after the run it deduplicated
+        # onto and label it with the duplicate's final state instead of
+        # leaving it Pending forever.
+        await _rename_dedup_placeholder(client, parent_task_run, flow_run)
         mirrored = await _mirror_dedup_placeholder_state(
             client, parent_task_run, flow_run, idempotency_key
         )
@@ -562,6 +614,7 @@ def run_deployment(
             and flow_run.parent_task_run_id != parent_task_run_id
         )
         if is_dedup:
+            _rename_dedup_placeholder_sync(sync_client, parent_task_run, flow_run)
             mirrored = _mirror_dedup_placeholder_state_sync(
                 sync_client, parent_task_run, flow_run, idempotency_key
             )

@@ -894,6 +894,7 @@ class TestDedupPlaceholderMirroring:
         assert str(first.id) in orphan.state.message
         assert f"http://test/ui/runs/flow-run/{first.id}" in orphan.state.message
         assert orphan.state.state_details.child_flow_run_id == first.id
+        assert orphan.name == f"duplicate-of-{first.name}"
 
     async def test_completed_duplicate_mirrors_onto_second_placeholder(
         self,
@@ -939,6 +940,7 @@ class TestDedupPlaceholderMirroring:
         assert orphan.state.type == StateType.COMPLETED
         assert idempotency_key in orphan.state.message
         assert orphan.state.state_details.child_flow_run_id == first.id
+        assert orphan.name == f"duplicate-of-{first.name}"
 
     async def test_fresh_create_gets_no_client_state_write(
         self,
@@ -981,8 +983,10 @@ class TestDedupPlaceholderMirroring:
         )
         assert len(placeholders) == 1
         assert placeholders[0].id == run.parent_task_run_id
-        # The child's initial Scheduled state is mirrored server-side.
+        # The child's initial Scheduled state is mirrored server-side, and a
+        # fresh (non-dedup) placeholder is never renamed.
         assert placeholders[0].state.type == StateType.SCHEDULED
+        assert not placeholders[0].name.startswith("duplicate-of-")
 
     async def test_nonterminal_duplicate_left_pending_on_timeout_zero(
         self,
@@ -1025,6 +1029,9 @@ class TestDedupPlaceholderMirroring:
             first_placeholder_ids["value"],
         )
         assert orphan.state.type == StateType.PENDING
+        # Renaming is clarity-only and applies even when the duplicate has
+        # no labelable terminal state yet.
+        assert orphan.name == f"duplicate-of-{first.name}"
 
     async def test_poll_exit_mirrors_final_state_of_dedup_duplicate(
         self,
@@ -1267,6 +1274,7 @@ class TestDedupPlaceholderMirroring:
         assert orphan.state.type == StateType.FAILED
         assert idempotency_key in orphan.state.message
         assert orphan.state.state_details.child_flow_run_id == first.id
+        assert orphan.name == f"duplicate-of-{first.name}"
 
 
 class TestRunDeploymentSyncContext:
